@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import struct
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
+import helper.protocol as protocol
 from helper.backend import extract_conversation_id, extract_references
+from helper.errors import UpstreamError
 from helper.main import read_frame, write_frame
-from helper.protocol import handle_images, parse_image_request
+from helper.protocol import ImageRequest, generate_one, handle_images, parse_image_request
 from helper.pow import build_legacy_requirements_token, parse_pow_resources
 
 PNG_1X1 = base64.b64decode(
@@ -35,8 +41,18 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _record_auth(self) -> None:
+        """只记录授权头摘要，供并发换号集成测试统计。"""
+        authorization = self.headers.get("Authorization") or ""
+        if not authorization:
+            return
+        digest = hashlib.sha256(authorization.encode()).hexdigest()
+        with self.server.auth_lock:
+            self.server.seen_authorizations.add(digest)
+
     def do_GET(self) -> None:
         """处理首页、下载地址和图片响应。"""
+        self._record_auth()
         if self.path == "/":
             raw = b'<html data-build="mock"><script src="/c/mock/_script.js"></script></html>'
             self.send_response(200)
@@ -51,6 +67,10 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(PNG_1X1)))
             self.end_headers()
             self.wfile.write(PNG_1X1)
+        elif self.path == "/__test__/auth-count":
+            with self.server.auth_lock:
+                count = len(self.server.seen_authorizations)
+            self._json({"count": count})
         elif self.path.startswith("/backend-api/conversation/"):
             self._json({"conversation_id": "conv_mock", "mapping": {"x": {"message": {
                 "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
@@ -60,6 +80,7 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         """处理 Sentinel、上传和 conversation 请求。"""
+        self._record_auth()
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)
@@ -71,6 +92,9 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
         elif self.path == "/backend-api/f/conversation/prepare":
             self._json({"conduit_token": "conduit"})
         elif self.path == "/backend-api/f/conversation":
+            delay = float(getattr(self.server, "generation_delay", 0))
+            if delay > 0:
+                time.sleep(delay)
             payload = {"conversation_id": "conv_mock", "message": {
                 "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
                 "content": {"parts": [f"file-service://{OUTPUT_FILE_ID}"]}}}
@@ -89,6 +113,7 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         """接收模拟对象存储图片上传。"""
+        self._record_auth()
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)
@@ -97,6 +122,7 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         """接收会话隐藏请求。"""
+        self._record_auth()
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)
@@ -110,6 +136,9 @@ class MockServer:
         """启动随机端口 HTTP 服务。"""
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockChatGPTHandler)
         self.server.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.server.generation_delay = 0
+        self.server.auth_lock = threading.Lock()
+        self.server.seen_authorizations = set()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return self
@@ -122,6 +151,14 @@ class MockServer:
 
 class HelperTests(unittest.TestCase):
     """验证助手的核心兼容行为。"""
+
+    def setUp(self) -> None:
+        """清理跨请求凭证调度状态，保证并发测试相互隔离。"""
+        with protocol._cursor_lock:
+            protocol._credential_cursor = 0
+        with protocol._state_lock:
+            protocol._credential_locks.clear()
+            protocol._cooldowns.clear()
 
     def test_pow_resources_and_token(self) -> None:
         """首页资源和 requirements token 应可稳定生成。"""
@@ -176,7 +213,73 @@ class HelperTests(unittest.TestCase):
             result = handle_images(edit)
             self.assertEqual(result["status_code"], 200)
 
+    def test_busy_credential_switches_immediately(self) -> None:
+        """首选凭证忙碌时应立即尝试其他账号而不是阻塞。"""
+        credentials = [{"access_token": "token-a"}, {"access_token": "token-b"}]
+        first_lock = protocol.credential_lock(protocol.credential_key(credentials[0]))
+        first_lock.acquire()
+        try:
+            with patch("helper.protocol.generate_with_credential",
+                       side_effect=lambda _request, credential, _settings:
+                       {"token": credential["access_token"]}):
+                result = generate_one(ImageRequest("cat"), credentials, {"timeout_seconds": 1}, 0)
+        finally:
+            first_lock.release()
+        self.assertEqual(result["token"], "token-b")
+
+    def test_cooldown_is_visible_to_following_requests(self) -> None:
+        """账号限流后并发和后续请求应跳过其冷却状态。"""
+        credentials = [{"access_token": "token-a"}, {"access_token": "token-b"}]
+        calls = {"token-a": 0, "token-b": 0}
+
+        def fake_generate(_request: ImageRequest, credential: dict, _settings: dict) -> dict:
+            """模拟首个账号限流、第二个账号成功。"""
+            token = credential["access_token"]
+            calls[token] += 1
+            if token == "token-a":
+                raise UpstreamError("rate limited", 429)
+            return {"token": token}
+
+        with patch("helper.protocol.generate_with_credential", side_effect=fake_generate):
+            first = generate_one(ImageRequest("cat"), credentials, {"timeout_seconds": 1}, 0)
+            with protocol._cursor_lock:
+                protocol._credential_cursor = 0
+            second = generate_one(ImageRequest("cat"), credentials, {"timeout_seconds": 1}, 0)
+        self.assertEqual(first["token"], "token-b")
+        self.assertEqual(second["token"], "token-b")
+        self.assertEqual(calls["token-a"], 1)
+
+    def test_concurrent_requests_use_distinct_credentials(self) -> None:
+        """高并发请求应并行使用不同账号且同账号不重入。"""
+        credentials = [{"access_token": f"token-{index}"} for index in range(4)]
+        guard = threading.Lock()
+        active: set[str] = set()
+        overlap: list[str] = []
+        peak = 0
+
+        def fake_generate(_request: ImageRequest, credential: dict, _settings: dict) -> dict:
+            """记录同时使用的凭证并模拟短时生成。"""
+            nonlocal peak
+            token = credential["access_token"]
+            with guard:
+                if token in active:
+                    overlap.append(token)
+                active.add(token)
+                peak = max(peak, len(active))
+            time.sleep(0.05)
+            with guard:
+                active.remove(token)
+            return {"token": token}
+
+        with patch("helper.protocol.generate_with_credential", side_effect=fake_generate):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(generate_one, ImageRequest("cat"), credentials,
+                                           {"timeout_seconds": 2}, index) for index in range(8)]
+                results = [future.result() for future in futures]
+        self.assertEqual(len(results), 8)
+        self.assertEqual(overlap, [])
+        self.assertGreaterEqual(peak, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-

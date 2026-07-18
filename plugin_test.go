@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +25,80 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.BaseURL != "http://127.0.0.1:9000" || cfg.RequestTimeout != 30*time.Second || cfg.CleanupConversation {
 		t.Fatalf("显式配置异常: %#v", cfg)
 	}
+}
+
+// TestReconfigureKeepsActiveHelper 验证重复配置和普通配置变化不会重启助手。
+func TestReconfigureKeepsActiveHelper(t *testing.T) {
+	cfg := runtimeConfig{BaseURL: defaultBaseURL, RequestTimeout: time.Minute, HelperPath: "helper-a"}
+	plugin := newImagePlugin(cfg)
+	original := plugin.helper
+	plugin.reconfigure(cfg)
+	if plugin.helper != original {
+		t.Fatal("相同配置不应替换助手")
+	}
+	cfg.ProxyURL = "http://127.0.0.1:8080"
+	plugin.reconfigure(cfg)
+	if plugin.helper != original {
+		t.Fatal("助手路径未变化时不应替换助手")
+	}
+	select {
+	case <-original.closed:
+		t.Fatal("普通配置变化不应关闭助手")
+	default:
+	}
+}
+
+// TestReconfigureDrainsOldHelper 验证路径热切换等待在途请求释放旧助手。
+func TestReconfigureDrainsOldHelper(t *testing.T) {
+	cfg := runtimeConfig{BaseURL: defaultBaseURL, RequestTimeout: time.Minute, HelperPath: "helper-a"}
+	plugin := newImagePlugin(cfg)
+	_, oldClient, release := plugin.acquireHelper()
+	oldSlot := plugin.helper
+	cfg.HelperPath = "helper-b"
+	plugin.reconfigure(cfg)
+	if plugin.helper == oldSlot || plugin.helper.client == oldClient {
+		t.Fatal("助手路径变化后新请求应切换到新助手")
+	}
+	select {
+	case <-oldSlot.closed:
+		t.Fatal("在途请求完成前不应关闭旧助手")
+	default:
+	}
+	release()
+	select {
+	case <-oldSlot.closed:
+	case <-time.After(time.Second):
+		t.Fatal("在途请求完成后旧助手未关闭")
+	}
+}
+
+// TestConcurrentReconfigureLeases 验证高并发租约与多次热切换不会提前关闭助手。
+func TestConcurrentReconfigureLeases(t *testing.T) {
+	cfg := runtimeConfig{BaseURL: defaultBaseURL, RequestTimeout: time.Minute, HelperPath: "helper-0"}
+	plugin := newImagePlugin(cfg)
+	const workers = 64
+	start := make(chan struct{})
+	releases := make(chan func(), workers)
+	var wait sync.WaitGroup
+	for index := 0; index < workers; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, _, release := plugin.acquireHelper()
+			releases <- release
+		}()
+	}
+	close(start)
+	wait.Wait()
+	for index := 1; index <= 4; index++ {
+		cfg.HelperPath = fmt.Sprintf("helper-%d", index)
+		plugin.reconfigure(cfg)
+	}
+	for index := 0; index < workers; index++ {
+		(<-releases)()
+	}
+	plugin.shutdown()
 }
 
 // TestRouteModel 验证仅目标模型和 Images API 路径被劫持。

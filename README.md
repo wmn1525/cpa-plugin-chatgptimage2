@@ -187,6 +187,8 @@ The credential must contain at least:
 
 The plugin discovers newly uploaded or refreshed credentials on subsequent requests. Authentication failures, rate limits, and temporary network errors trigger credential rotation and an in-memory cooldown.
 
+Credential uploads do not restart the helper. Repeated CPA configuration reloads keep the current helper, while a real helper-path change routes new requests to a new process and lets the old process finish all in-flight generations before shutdown. Busy credentials are skipped without blocking other available accounts.
+
 ## API Examples
 
 ### Image Generation
@@ -272,8 +274,8 @@ Manual workflow runs create downloadable Actions artifacts but do not create a f
 ## Tests
 
 ```powershell
-go test ./...
-go vet ./...
+go test -race .
+go vet .
 py -3.12 -m unittest -v tests.test_helper tests.test_helper_exe
 ```
 

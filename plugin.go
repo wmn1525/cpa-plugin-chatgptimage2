@@ -21,7 +21,14 @@ var pluginVersion = "0.1.0"
 type imagePlugin struct {
 	mu     sync.RWMutex
 	config runtimeConfig
-	helper *helperClient
+	helper *helperSlot
+}
+
+type helperSlot struct {
+	client    *helperClient
+	active    sync.WaitGroup
+	closeOnce sync.Once
+	closed    chan struct{}
 }
 
 type lifecycleRequest struct {
@@ -64,33 +71,77 @@ type streamResponse struct {
 
 // newImagePlugin 创建插件运行实例并定位同目录助手程序。
 func newImagePlugin(cfg runtimeConfig) *imagePlugin {
-	return &imagePlugin{config: cfg, helper: newHelperClient(cfg.HelperPath)}
+	return &imagePlugin{config: cfg, helper: newHelperSlot(cfg.HelperPath)}
 }
 
-// reconfigure 更新插件配置并重启助手进程以清理旧会话。
+// newHelperSlot 创建可追踪在途请求的助手实例。
+func newHelperSlot(path string) *helperSlot {
+	return &helperSlot{client: newHelperClient(path), closed: make(chan struct{})}
+}
+
+// retire 在全部在途请求完成后关闭已替换的助手。
+func (s *helperSlot) retire() {
+	if s == nil {
+		return
+	}
+	go func() {
+		s.active.Wait()
+		s.close()
+	}()
+}
+
+// close 只关闭一次助手并通知测试和生命周期等待方。
+func (s *helperSlot) close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		s.client.Close()
+		close(s.closed)
+	})
+}
+
+// acquireHelper 获取配置快照和助手租约，避免热切换中断请求。
+func (p *imagePlugin) acquireHelper() (runtimeConfig, *helperClient, func()) {
+	p.mu.RLock()
+	slot := p.helper
+	if slot == nil {
+		p.mu.RUnlock()
+		return runtimeConfig{}, nil, func() {}
+	}
+	slot.active.Add(1)
+	cfg := p.config
+	p.mu.RUnlock()
+	return cfg, slot.client, slot.active.Done
+}
+
+// reconfigure 更新配置；只有助手路径变化时才无中断切换进程。
 func (p *imagePlugin) reconfigure(cfg runtimeConfig) {
 	p.mu.Lock()
-	oldHelper := p.helper
-	if oldHelper == nil || oldHelper.path != cfg.HelperPath {
-		p.helper = newHelperClient(cfg.HelperPath)
+	if p.config == cfg && p.helper != nil {
+		p.mu.Unlock()
+		return
 	}
+	oldHelper := p.helper
+	if oldHelper == nil || oldHelper.client.path != cfg.HelperPath {
+		p.helper = newHelperSlot(cfg.HelperPath)
+	}
+	newHelper := p.helper
 	p.config = cfg
-	helper := p.helper
 	p.mu.Unlock()
-	if oldHelper != nil && oldHelper != helper {
-		oldHelper.Close()
-	} else if helper != nil {
-		helper.Restart()
+	if oldHelper != nil && oldHelper != newHelper {
+		oldHelper.retire()
 	}
 }
 
 // shutdown 关闭插件持有的助手进程。
 func (p *imagePlugin) shutdown() {
-	p.mu.RLock()
+	p.mu.Lock()
 	helper := p.helper
-	p.mu.RUnlock()
+	p.helper = nil
+	p.mu.Unlock()
 	if helper != nil {
-		helper.Close()
+		helper.close()
 	}
 }
 
@@ -132,7 +183,7 @@ func registrationInfo() registration {
 			Name:             "CPA ChatGPT 网页生图",
 			Version:          pluginVersion,
 			Author:           "cpaimage",
-			GitHubRepository: "https://github.com/basketikun/chatgpt2api",
+			GitHubRepository: "https://github.com/wmn1525/cpa-plugin-chatgptimage2",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "base_url", Type: pluginapi.ConfigFieldTypeString, Description: "ChatGPT 网页上游地址。"},
 				{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "单次生图总超时，例如 20m。"},

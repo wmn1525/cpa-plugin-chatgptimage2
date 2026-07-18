@@ -39,10 +39,11 @@ func (p *imagePlugin) executeHelper(req rpcExecutorRequest) (executionResult, er
 	if err != nil {
 		return executionResult{}, err
 	}
-	p.mu.RLock()
-	cfg := p.config
-	helper := p.helper
-	p.mu.RUnlock()
+	cfg, helper, release := p.acquireHelper()
+	defer release()
+	if helper == nil {
+		return executionResult{}, fmt.Errorf("助手尚未初始化")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancel()
 	payload := helperExecutionRequest{

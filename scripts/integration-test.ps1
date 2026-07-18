@@ -20,6 +20,9 @@ Copy-Item -LiteralPath (Join-Path $root "dist\cpaimage-helper.exe") -Destination
 $authJson = @'
 {"type":"codex","email":"mock@example.com","access_token":"eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NfbW9jayIsImNoYXRncHRfcGxhbl90eXBlIjoicGx1cyJ9fQ.x"}
 '@
+$authJson2 = @'
+{"type":"codex","email":"mock2@example.com","access_token":"eyJhbGciOiJub25lIn0.eyJleHAiOjQxNDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NfbW9jazIiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMifX0.y"}
+'@
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $auth "mock.json"), $authJson.Trim(), $utf8NoBom)
 
@@ -51,7 +54,7 @@ $mock = $null
 $cpa = $null
 try {
     # 启动模拟 ChatGPT 与真实 CPA 进程。
-    $mock = Start-Process -FilePath "py" -ArgumentList "-3.12", "-m", "tests.mock_server_entry", "--port", "18081" -WorkingDirectory $root -PassThru -WindowStyle Hidden
+    $mock = Start-Process -FilePath "py" -ArgumentList "-3.12", "-m", "tests.mock_server_entry", "--port", "18081", "--generation-delay", "0.35" -WorkingDirectory $root -PassThru -WindowStyle Hidden
     $cpa = Start-Process -FilePath $CpaExe -ArgumentList "--config", (Join-Path $runtime "config.yaml") -WorkingDirectory $runtime -RedirectStandardOutput (Join-Path $runtime "cpa.stdout.log") -RedirectStandardError (Join-Path $runtime "cpa.stderr.log") -PassThru -WindowStyle Hidden
 
     $ready = $false
@@ -72,6 +75,45 @@ try {
     $response = Invoke-RestMethod "http://127.0.0.1:18317/v1/images/generations" -Method Post -ContentType "application/json" -Headers @{Authorization="Bearer integration-key"} -Body $body
     if (-not $response.data[0].b64_json) {
         throw "CPA 插件未返回 b64_json 图片。"
+    }
+
+    # 热上传第二个凭证，后续请求应直接从 CPA 发现而无需重启插件。
+    [IO.File]::WriteAllText((Join-Path $auth "mock2.json"), $authJson2.Trim(), $utf8NoBom)
+    Start-Sleep -Seconds 2
+
+    # 并发请求期间重复写入和变更配置，所有在途生成必须完成。
+    Add-Type -AssemblyName System.Net.Http
+    $client = [Net.Http.HttpClient]::new()
+    $client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", "integration-key")
+    $tasks = [Collections.Generic.List[Threading.Tasks.Task]]::new()
+    for ($index = 0; $index -lt 8; $index++) {
+        $concurrentBody = @{model="gpt-image-2"; prompt="并发猫-$index"; response_format="b64_json"} | ConvertTo-Json -Compress
+        $content = [Net.Http.StringContent]::new($concurrentBody, [Text.Encoding]::UTF8, "application/json")
+        $tasks.Add($client.PostAsync("http://127.0.0.1:18317/v1/images/generations", $content))
+    }
+    Start-Sleep -Milliseconds 300
+    [IO.File]::WriteAllText((Join-Path $runtime "config.yaml"), $configYaml, $utf8NoBom)
+    Start-Sleep -Milliseconds 300
+    $changedConfig = $configYaml.Replace("cleanup_conversation: true", "cleanup_conversation: false")
+    [IO.File]::WriteAllText((Join-Path $runtime "config.yaml"), $changedConfig, $utf8NoBom)
+    if (-not [Threading.Tasks.Task]::WaitAll($tasks.ToArray(), 30000)) {
+        throw "配置热切换期间并发请求未在超时内完成。"
+    }
+    foreach ($task in $tasks) {
+        $httpResponse = [Net.Http.HttpResponseMessage]$task.Result
+        $rawBody = $httpResponse.Content.ReadAsStringAsync().Result
+        if (-not $httpResponse.IsSuccessStatusCode) {
+            throw "配置热切换期间请求失败：HTTP $([int]$httpResponse.StatusCode) $rawBody"
+        }
+        $parsedBody = $rawBody | ConvertFrom-Json
+        if (-not $parsedBody.data[0].b64_json) {
+            throw "配置热切换期间请求未返回图片。"
+        }
+    }
+    $client.Dispose()
+    $authCount = (Invoke-RestMethod "http://127.0.0.1:18081/__test__/auth-count").count
+    if ($authCount -lt 2) {
+        throw "并发请求未使用热上传的第二个 CPA 凭证。"
     }
 
     # 验证多图与流式请求均经过插件执行器。

@@ -187,6 +187,8 @@ C:\CLIProxyAPI\plugins\windows\amd64\cpaimage-helper.exe
 
 插件会在后续请求中自动发现新增或刷新的凭证。认证失败、限流和临时网络错误会触发换号及内存冷却。
 
+上传凭证不会重启助手。CPA 重复下发配置时继续使用当前助手；只有助手路径真正变化时，新请求才切换到新进程，旧进程会在全部在途生成完成后关闭。凭证忙碌时会立即跳过并尝试其他可用账号。
+
 ## API 示例
 
 ### 文生图
@@ -272,8 +274,8 @@ git push origin HEAD:release/v0.1.0
 ## 测试
 
 ```powershell
-go test ./...
-go vet ./...
+go test -race .
+go vet .
 py -3.12 -m unittest -v tests.test_helper tests.test_helper_exe
 ```
 

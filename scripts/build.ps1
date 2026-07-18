@@ -21,8 +21,8 @@ py -3.12 -c "import curl_cffi, PIL, PyInstaller" | Out-Null
 Push-Location $root
 try {
     Get-ChildItem -Filter *.go | ForEach-Object { gofmt -w $_.FullName }
-    go test ./...
-    go vet ./...
+    go test -race .
+    go vet .
     py -3.12 -m unittest -v tests.test_helper
 
     New-Item -ItemType Directory -Force -Path $dist | Out-Null

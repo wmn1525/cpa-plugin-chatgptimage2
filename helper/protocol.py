@@ -20,6 +20,7 @@ from helper.backend import WebImageBackend, extract_conversation_id, extract_ref
 from helper.errors import HelperError, UpstreamError
 
 _cursor_lock = threading.Lock()
+_state_lock = threading.Lock()
 _credential_cursor = 0
 _credential_locks: dict[str, threading.Lock] = {}
 _cooldowns: dict[str, float] = {}
@@ -135,30 +136,77 @@ def parse_multipart(body: bytes, content_type: str) -> tuple[dict[str, list[str]
 
 
 def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], settings: dict[str, Any], index: int) -> dict[str, Any]:
-    """为单张图片轮询尝试 CPA 凭证直到成功。"""
+    """为单张图片非阻塞轮询 CPA 凭证，忙碌账号不会阻塞换号。"""
     ordered = rotate_credentials(credentials, index)
     errors: list[str] = []
-    for credential in ordered:
-        token = str(credential.get("access_token") or "")
-        key = hashlib.sha256(token.encode()).hexdigest()
-        if _cooldowns.get(key, 0) > time.time():
-            continue
-        lock = _credential_locks.setdefault(key, threading.Lock())
-        with lock:
+    attempted: set[str] = set()
+    wait_seconds = min(max(float(settings.get("timeout_seconds") or 30), 1.0), 30.0)
+    wait_deadline = time.monotonic() + wait_seconds
+    while len(attempted) < len({credential_key(item) for item in ordered}):
+        busy = False
+        progressed = False
+        for credential in ordered:
+            key = credential_key(credential)
+            if key in attempted:
+                continue
+            if credential_cooling(key):
+                attempted.add(key)
+                continue
+            lock = credential_lock(key)
+            if not lock.acquire(blocking=False):
+                busy = True
+                continue
+            if credential_cooling(key):
+                attempted.add(key)
+                lock.release()
+                continue
+            attempted.add(key)
+            progressed = True
             try:
                 return generate_with_credential(request, credential, settings)
             except UpstreamError as exc:
                 errors.append(str(exc))
                 if exc.status_code in (401, 403):
-                    _cooldowns[key] = time.time() + 300
+                    set_credential_cooldown(key, 300)
                 elif exc.status_code == 429:
-                    _cooldowns[key] = time.time() + 120
+                    set_credential_cooldown(key, 120)
                 elif exc.retryable:
-                    _cooldowns[key] = time.time() + 30
+                    set_credential_cooldown(key, 30)
             except Exception as exc:
                 errors.append(str(exc))
-                _cooldowns[key] = time.time() + 15
-    raise HelperError(errors[-1] if errors else "全部 CPA 凭证均不可用", 503, "all_credentials_failed")
+                set_credential_cooldown(key, 15)
+            finally:
+                lock.release()
+        if busy and not progressed and time.monotonic() < wait_deadline:
+            time.sleep(0.02)
+            continue
+        if not busy or time.monotonic() >= wait_deadline:
+            break
+    raise HelperError(errors[-1] if errors else "全部 CPA 凭证均忙碌或不可用", 503, "all_credentials_failed")
+
+
+def credential_key(credential: dict[str, Any]) -> str:
+    """使用 Token 摘要生成不泄露凭证的进程内调度键。"""
+    token = str(credential.get("access_token") or "")
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def credential_lock(key: str) -> threading.Lock:
+    """线程安全地获取单凭证互斥锁。"""
+    with _state_lock:
+        return _credential_locks.setdefault(key, threading.Lock())
+
+
+def credential_cooling(key: str) -> bool:
+    """检查凭证是否仍处于内存冷却期。"""
+    with _state_lock:
+        return _cooldowns.get(key, 0) > time.time()
+
+
+def set_credential_cooldown(key: str, seconds: float) -> None:
+    """线程安全地更新凭证冷却截止时间。"""
+    with _state_lock:
+        _cooldowns[key] = time.time() + seconds
 
 
 def rotate_credentials(credentials: list[dict[str, Any]], offset: int) -> list[dict[str, Any]]:
