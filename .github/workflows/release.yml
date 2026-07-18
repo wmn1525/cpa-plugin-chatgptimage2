@@ -78,10 +78,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-helper.txt
 
-      - name: 配置 MinGW-w64
-        uses: egor-tensin/setup-mingw@v2
-        with:
-          platform: x64
+      - name: 检查 Windows 构建工具链
+        shell: pwsh
+        run: |
+          go version
+          gcc --version
+          py -3.12 --version
 
       - name: 安装 Python 依赖
         shell: pwsh
