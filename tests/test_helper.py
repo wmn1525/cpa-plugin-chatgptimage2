@@ -14,8 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import helper.protocol as protocol
-from helper.backend import extract_conversation_id, extract_references
-from helper.errors import UpstreamError
+from helper.backend import WebImageBackend, extract_conversation_id, extract_references
+from helper.control import RequestControl
+from helper.errors import HelperError, UpstreamError
 from helper.main import read_frame, write_frame
 from helper.protocol import ImageRequest, generate_one, handle_images, parse_image_request
 from helper.pow import build_legacy_requirements_token, parse_pow_resources
@@ -72,6 +73,11 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
                 count = len(self.server.seen_authorizations)
             self._json({"count": count})
         elif self.path.startswith("/backend-api/conversation/"):
+            with self.server.poll_lock:
+                status = self.server.poll_statuses.pop(0) if self.server.poll_statuses else 200
+            if status != 200:
+                self._json({"temporary": True}, status)
+                return
             self._json({"conversation_id": "conv_mock", "mapping": {"x": {"message": {
                 "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
                 "content": {"parts": [f"file-service://{OUTPUT_FILE_ID}"]}}}}})
@@ -137,6 +143,8 @@ class MockServer:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockChatGPTHandler)
         self.server.base_url = f"http://127.0.0.1:{self.server.server_port}"
         self.server.generation_delay = 0
+        self.server.poll_lock = threading.Lock()
+        self.server.poll_statuses = []
         self.server.auth_lock = threading.Lock()
         self.server.seen_authorizations = set()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -220,19 +228,86 @@ class HelperTests(unittest.TestCase):
         first_lock.acquire()
         try:
             with patch("helper.protocol.generate_with_credential",
-                       side_effect=lambda _request, credential, _settings:
+                       side_effect=lambda _request, credential, _settings, _control:
                        {"token": credential["access_token"]}):
                 result = generate_one(ImageRequest("cat"), credentials, {"timeout_seconds": 1}, 0)
         finally:
             first_lock.release()
         self.assertEqual(result["token"], "token-b")
 
+    def test_busy_credential_waits_until_released(self) -> None:
+        """全部账号忙碌时应在总截止时间内排队并在释放后继续。"""
+        credentials = [{"access_token": "token-a"}]
+        lock = protocol.credential_lock(protocol.credential_key(credentials[0]))
+        lock.acquire()
+        timer = threading.Timer(0.1, lock.release)
+        timer.start()
+        try:
+            with patch("helper.protocol.generate_with_credential", return_value={"ok": True}):
+                result = generate_one(ImageRequest("cat"), credentials, {"timeout_seconds": 1}, 0)
+        finally:
+            timer.join()
+            if lock.locked():
+                lock.release()
+        self.assertTrue(result["ok"])
+
+    def test_generation_deadline_releases_credential(self) -> None:
+        """上游长时间不返回时应按总超时结束并释放凭证锁。"""
+        with MockServer() as mock:
+            mock.server.generation_delay = 0.5
+            payload = {"credentials": [{"access_token": "timeout-token"}],
+                       "base_url": mock.server.base_url, "timeout_seconds": 0.1,
+                       "cleanup_conversation": True, "content_type": "application/json", "stream": False,
+                       "request_path": "/v1/images/generations",
+                       "body_base64": base64.b64encode(b'{"prompt":"cat"}').decode()}
+            with self.assertRaises(HelperError) as caught:
+                handle_images(payload)
+            key = protocol.credential_key(payload["credentials"][0])
+            self.assertTrue(protocol.credential_lock(key).acquire(blocking=False))
+            protocol.credential_lock(key).release()
+        self.assertEqual(caught.exception.status_code, 504)
+
+    def test_poll_retries_524(self) -> None:
+        """Cloudflare 524 应按临时错误重试而不是立即判定失败。"""
+        with MockServer() as mock:
+            mock.server.poll_statuses = [524, 200]
+            control = RequestControl(2)
+            backend = WebImageBackend("fake-token", mock.server.base_url, control)
+            try:
+                with patch.object(control, "sleep"):
+                    files, _ = backend.poll_image_references("conv_mock", ["seed"], [], 1)
+            finally:
+                backend.close()
+        self.assertIn(OUTPUT_FILE_ID, files)
+
+    def test_cancel_closes_registered_resource(self) -> None:
+        """取消请求时应关闭正在阻塞的网络资源并使后续阶段停止。"""
+        class Resource:
+            """记录测试资源是否被关闭。"""
+
+            def __init__(self) -> None:
+                """创建未关闭的测试资源。"""
+                self.closed = False
+
+            def close(self) -> None:
+                """记录关闭动作。"""
+                self.closed = True
+
+        control = RequestControl(10)
+        resource = Resource()
+        control.register(resource)
+        control.cancel()
+        self.assertTrue(resource.closed)
+        with self.assertRaises(HelperError):
+            control.timeout()
+
     def test_cooldown_is_visible_to_following_requests(self) -> None:
         """账号限流后并发和后续请求应跳过其冷却状态。"""
         credentials = [{"access_token": "token-a"}, {"access_token": "token-b"}]
         calls = {"token-a": 0, "token-b": 0}
 
-        def fake_generate(_request: ImageRequest, credential: dict, _settings: dict) -> dict:
+        def fake_generate(_request: ImageRequest, credential: dict, _settings: dict,
+                          _control: RequestControl) -> dict:
             """模拟首个账号限流、第二个账号成功。"""
             token = credential["access_token"]
             calls[token] += 1
@@ -257,7 +332,8 @@ class HelperTests(unittest.TestCase):
         overlap: list[str] = []
         peak = 0
 
-        def fake_generate(_request: ImageRequest, credential: dict, _settings: dict) -> dict:
+        def fake_generate(_request: ImageRequest, credential: dict, _settings: dict,
+                          _control: RequestControl) -> dict:
             """记录同时使用的凭证并模拟短时生成。"""
             nonlocal peak
             token = credential["access_token"]

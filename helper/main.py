@@ -10,10 +10,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO
 
+from helper.control import RequestControl
 from helper.errors import HelperError
 from helper.protocol import handle_images
 
 _write_lock = threading.Lock()
+_active_lock = threading.Lock()
+_active_controls: dict[int, RequestControl] = {}
 
 
 def read_frame(stream: BinaryIO) -> dict[str, Any] | None:
@@ -44,13 +47,13 @@ def write_frame(stream: BinaryIO, value: dict[str, Any]) -> None:
         stream.flush()
 
 
-def process_request(request: dict[str, Any], output: BinaryIO) -> None:
+def process_request(request: dict[str, Any], output: BinaryIO, control: RequestControl) -> None:
     """处理单个 RPC 请求并写回统一响应。"""
     request_id = int(request.get("id") or 0)
     try:
         if request.get("method") != "images":
             raise HelperError("unknown helper method", 400, "unknown_method")
-        result = handle_images(request.get("payload") or {})
+        result = handle_images(request.get("payload") or {}, control)
         response = {"id": request_id, "ok": True, "result": result}
     except HelperError as exc:
         response = {"id": request_id, "ok": False,
@@ -58,19 +61,49 @@ def process_request(request: dict[str, Any], output: BinaryIO) -> None:
     except Exception as exc:
         response = {"id": request_id, "ok": False,
                     "error": {"code": "helper_error", "message": str(exc), "http_status": 502}}
+    finally:
+        with _active_lock:
+            if _active_controls.get(request_id) is control:
+                del _active_controls[request_id]
     write_frame(output, response)
+
+
+def cancel_request(request: dict[str, Any], output: BinaryIO) -> None:
+    """取消指定 RPC 请求并立即确认取消帧。"""
+    request_id = int(request.get("id") or 0)
+    target_id = int((request.get("payload") or {}).get("request_id") or 0)
+    with _active_lock:
+        control = _active_controls.get(target_id)
+    if control is not None:
+        control.cancel()
+    write_frame(output, {"id": request_id, "ok": True, "result": {"cancelled": control is not None}})
 
 
 def serve_stdio() -> int:
     """在标准输入输出上运行并发 RPC 服务。"""
     input_stream = sys.stdin.buffer
     output_stream = sys.stdout.buffer
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    executor = ThreadPoolExecutor(max_workers=8)
+    try:
         while True:
             request = read_frame(input_stream)
             if request is None:
                 return 0
-            executor.submit(process_request, request, output_stream)
+            if request.get("method") == "cancel":
+                cancel_request(request, output_stream)
+                continue
+            payload = request.get("payload") or {}
+            control = RequestControl(float(payload.get("timeout_seconds") or 30))
+            request_id = int(request.get("id") or 0)
+            with _active_lock:
+                _active_controls[request_id] = control
+            executor.submit(process_request, request, output_stream, control)
+    finally:
+        with _active_lock:
+            controls = list(_active_controls.values())
+        for control in controls:
+            control.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def main() -> int:
@@ -83,4 +116,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

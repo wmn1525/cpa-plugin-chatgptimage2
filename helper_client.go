@@ -75,8 +75,21 @@ func (c *helperClient) Call(ctx context.Context, method string, payload any, res
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
+		c.cancelCall(id)
 		return ctx.Err()
 	}
+}
+
+// cancelCall 通知助手关闭超时请求仍占用的网页会话。
+func (c *helperClient) cancelCall(requestID uint64) {
+	c.mu.Lock()
+	stdin := c.stdin
+	c.mu.Unlock()
+	if stdin == nil {
+		return
+	}
+	id := c.nextID.Add(1)
+	_ = c.writeFrame(stdin, helperRequest{ID: id, Method: "cancel", Payload: map[string]uint64{"request_id": requestID}})
 }
 
 // Restart 关闭当前助手，使下一次调用使用新配置启动。

@@ -17,6 +17,7 @@ from typing import Any
 from PIL import Image
 
 from helper.backend import WebImageBackend, extract_conversation_id, extract_references
+from helper.control import RequestControl
 from helper.errors import HelperError, UpstreamError
 
 _cursor_lock = threading.Lock()
@@ -40,8 +41,9 @@ class ImageRequest:
     masks: list[str] = field(default_factory=list)
 
 
-def handle_images(payload: dict[str, Any]) -> dict[str, Any]:
+def handle_images(payload: dict[str, Any], control: RequestControl | None = None) -> dict[str, Any]:
     """处理一次来自 DLL 的生成或编辑请求。"""
+    control = control or RequestControl(float(payload.get("timeout_seconds") or 30))
     request = parse_image_request(base64.b64decode(payload.get("body_base64") or ""),
                                   str(payload.get("content_type") or ""), bool(payload.get("stream")),
                                   str(payload.get("request_path") or ""))
@@ -51,7 +53,7 @@ def handle_images(payload: dict[str, Any]) -> dict[str, Any]:
     results: list[dict[str, Any] | None] = [None] * request.n
     workers = min(request.n, len(credentials), 4)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = {executor.submit(generate_one, request, credentials, payload, index): index
+        futures = {executor.submit(generate_one, request, credentials, payload, index, control): index
                    for index in range(request.n)}
         for future in as_completed(futures):
             index = futures[future]
@@ -135,14 +137,14 @@ def parse_multipart(body: bytes, content_type: str) -> tuple[dict[str, list[str]
     return values, files
 
 
-def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], settings: dict[str, Any], index: int) -> dict[str, Any]:
+def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], settings: dict[str, Any], index: int,
+                 control: RequestControl | None = None) -> dict[str, Any]:
     """为单张图片非阻塞轮询 CPA 凭证，忙碌账号不会阻塞换号。"""
+    control = control or RequestControl(float(settings.get("timeout_seconds") or 30))
     ordered = rotate_credentials(credentials, index)
     errors: list[str] = []
     attempted: set[str] = set()
-    wait_seconds = min(max(float(settings.get("timeout_seconds") or 30), 1.0), 30.0)
-    wait_deadline = time.monotonic() + wait_seconds
-    while len(attempted) < len({credential_key(item) for item in ordered}):
+    while len(attempted) < len({credential_key(item) for item in ordered}) and not control.expired():
         busy = False
         progressed = False
         for credential in ordered:
@@ -163,7 +165,7 @@ def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], setti
             attempted.add(key)
             progressed = True
             try:
-                return generate_with_credential(request, credential, settings)
+                return generate_with_credential(request, credential, settings, control)
             except UpstreamError as exc:
                 errors.append(str(exc))
                 if exc.status_code in (401, 403):
@@ -172,16 +174,20 @@ def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], setti
                     set_credential_cooldown(key, 120)
                 elif exc.retryable:
                     set_credential_cooldown(key, 30)
+            except HelperError as exc:
+                errors.append(str(exc))
             except Exception as exc:
                 errors.append(str(exc))
                 set_credential_cooldown(key, 15)
             finally:
                 lock.release()
-        if busy and not progressed and time.monotonic() < wait_deadline:
-            time.sleep(0.02)
+        if busy and not progressed and not control.expired():
+            control.sleep(0.02)
             continue
-        if not busy or time.monotonic() >= wait_deadline:
+        if not busy or control.expired():
             break
+    if control.expired():
+        raise HelperError("等待可用 CPA 凭证或网页生图执行超时", 504, "image_timeout")
     raise HelperError(errors[-1] if errors else "全部 CPA 凭证均忙碌或不可用", 503, "all_credentials_failed")
 
 
@@ -218,11 +224,12 @@ def rotate_credentials(credentials: list[dict[str, Any]], offset: int) -> list[d
     return credentials[start:] + credentials[:start]
 
 
-def generate_with_credential(request: ImageRequest, credential: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+def generate_with_credential(request: ImageRequest, credential: dict[str, Any], settings: dict[str, Any],
+                             control: RequestControl) -> dict[str, Any]:
     """使用单个 CPA 凭证执行完整网页生图流程。"""
     proxy_url = str(credential.get("proxy_url") or settings.get("proxy_url") or "")
     backend = WebImageBackend(str(credential.get("access_token") or ""), str(settings.get("base_url") or ""),
-                              proxy_url, str(settings.get("cf_cookies") or ""))
+                              control, proxy_url, str(settings.get("cf_cookies") or ""))
     conversation_id = ""
     try:
         normalized_images = [normalize_image_source(backend, value) for value in request.images]
@@ -250,8 +257,7 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
             if not conversation_id:
                 raise HelperError("上游 SSE 未返回 conversation_id")
             if not files and not sediments:
-                files, sediments = backend.poll_image_references(conversation_id, files, sediments,
-                                                                  min(float(settings.get("timeout_seconds") or 120), 180.0))
+                files, sediments = backend.poll_image_references(conversation_id, files, sediments, control.timeout())
             images = backend.download_images(conversation_id, files, sediments)
             if not images:
                 raise HelperError("上游完成但未取得图片结果")
@@ -263,6 +269,12 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
         else:
             item["b64_json"] = encoded
         return item
+    except HelperError:
+        raise
+    except Exception as exc:
+        if control.expired():
+            raise HelperError("ChatGPT 网页生图请求总超时", 504, "image_timeout") from exc
+        raise UpstreamError(f"ChatGPT 网页请求失败: {exc}", 502, True) from exc
     finally:
         if conversation_id and settings.get("cleanup_conversation", True):
             try:
@@ -277,7 +289,7 @@ def normalize_image_source(backend: WebImageBackend, value: str) -> str:
     if value.startswith("data:image/"):
         return value
     if value.startswith("http://") or value.startswith("https://"):
-        response = backend.session.get(value, timeout=120)
+        response = backend.session.get(value, timeout=backend.control.timeout(120))
         backend._check(response, "input_image_download")
         mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0]
         return f"data:{mime};base64," + base64.b64encode(response.content).decode()

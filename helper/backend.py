@@ -15,6 +15,7 @@ from typing import Any, Iterator
 from curl_cffi import requests
 from PIL import Image
 
+from helper.control import RequestControl
 from helper.errors import HelperError, UpstreamError
 from helper.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from helper.turnstile import solve_turnstile_token
@@ -35,10 +36,12 @@ class ChatRequirements:
 class WebImageBackend:
     """封装单个 CPA access_token 对应的网页会话。"""
 
-    def __init__(self, access_token: str, base_url: str, proxy_url: str = "", cf_cookies: str = "") -> None:
+    def __init__(self, access_token: str, base_url: str, control: RequestControl,
+                 proxy_url: str = "", cf_cookies: str = "") -> None:
         """创建带浏览器 TLS 指纹和 Cookie 池的 curl_cffi 会话。"""
         self.access_token = access_token
         self.base_url = base_url.rstrip("/")
+        self.control = control
         self.device_id = str(uuid.uuid4())
         self.session_id = str(uuid.uuid4())
         self.user_agent = (
@@ -49,6 +52,7 @@ class WebImageBackend:
         if proxy_url:
             options["proxy"] = proxy_url
         self.session = requests.Session(**options)
+        self.control.register(self.session)
         self.session.headers.update({
             "Authorization": f"Bearer {access_token}",
             "User-Agent": self.user_agent,
@@ -77,6 +81,7 @@ class WebImageBackend:
 
     def close(self) -> None:
         """释放 curl_cffi 会话资源。"""
+        self.control.unregister(self.session)
         self.session.close()
 
     def _headers(self, path: str, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -112,7 +117,7 @@ class WebImageBackend:
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Upgrade-Insecure-Requests": "1",
-        }, timeout=30)
+        }, timeout=self.control.timeout(30))
         self._check(response, "bootstrap")
         self.script_sources, self.data_build = parse_pow_resources(response.text)
 
@@ -123,7 +128,7 @@ class WebImageBackend:
         prepare_path = base + "/prepare"
         response = self.session.post(self.base_url + prepare_path,
                                      headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
-                                     json={"p": p_token}, timeout=30)
+                                     json={"p": p_token}, timeout=self.control.timeout(30))
         self._check(response, prepare_path)
         data = response.json()
         if (data.get("arkose") or {}).get("required"):
@@ -141,7 +146,7 @@ class WebImageBackend:
         response = self.session.post(self.base_url + finalize_path,
                                      headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
                                      json={"prepare_token": data.get("prepare_token", ""), "proof_token": proof_token,
-                                           "turnstile_token": turnstile_token}, timeout=30)
+                                           "turnstile_token": turnstile_token}, timeout=self.control.timeout(30))
         self._check(response, finalize_path)
         finalized = response.json()
         token = str(finalized.get("token") or "")
@@ -159,17 +164,18 @@ class WebImageBackend:
         response = self.session.post(self.base_url + path,
                                      headers=self._headers(path, {"Content-Type": "application/json"}),
                                      json={"file_name": file_name, "file_size": len(raw), "use_case": "multimodal",
-                                           "width": width, "height": height}, timeout=60)
+                                           "width": width, "height": height}, timeout=self.control.timeout(60))
         self._check(response, path)
         metadata = response.json()
         upload = self.session.put(metadata["upload_url"], headers={"Content-Type": mime_type,
                                   "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08",
-                                  "Origin": self.base_url, "Referer": self.base_url + "/"}, data=raw, timeout=120)
+                                  "Origin": self.base_url, "Referer": self.base_url + "/"}, data=raw,
+                                  timeout=self.control.timeout(120))
         self._check(upload, "image_upload")
         confirm_path = f"/backend-api/files/{metadata['file_id']}/uploaded"
         response = self.session.post(self.base_url + confirm_path,
                                      headers=self._headers(confirm_path, {"Content-Type": "application/json"}),
-                                     data="{}", timeout=60)
+                                     data="{}", timeout=self.control.timeout(60))
         self._check(response, confirm_path)
         return {"file_id": metadata["file_id"], "file_name": file_name, "file_size": len(raw),
                 "mime_type": mime_type, "width": width, "height": height}
@@ -185,7 +191,7 @@ class WebImageBackend:
                    "supports_buffering": True, "supported_encodings": ["v1"],
                    "client_contextual_info": {"app_name": "chatgpt.com"}}
         response = self.session.post(self.base_url + path, headers=self._image_headers(path, requirements),
-                                     json=payload, timeout=60)
+                                     json=payload, timeout=self.control.timeout(60))
         self._check(response, path)
         return str(response.json().get("conduit_token") or "")
 
@@ -215,9 +221,12 @@ class WebImageBackend:
         path = "/backend-api/f/conversation"
         response = self.session.post(self.base_url + path,
                                      headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-                                     json=payload, timeout=300, stream=True)
+                                     json=payload, timeout=self.control.timeout(300), stream=True)
         self._check(response, path)
-        yield from iter_sse_json(response)
+        try:
+            yield from iter_sse_json(response, self.control)
+        finally:
+            response.close()
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "",
                        accept: str = "*/*") -> dict[str, str]:
@@ -237,15 +246,16 @@ class WebImageBackend:
         """轮询 conversation 文档直到出现可下载图片引用。"""
         deadline = time.monotonic() + timeout
         if not file_ids and not sediment_ids:
-            time.sleep(min(5.0, max(0.0, timeout)))
+            self.control.sleep(min(5.0, max(0.0, timeout)))
         attempt = 0
         while time.monotonic() < deadline:
             attempt += 1
             path = f"/backend-api/conversation/{conversation_id}"
             response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                        timeout=60)
-            if response.status_code in (429, 500, 502, 503, 504):
-                time.sleep(min(2 ** min(attempt, 4) + random.random(), max(0.0, deadline - time.monotonic())))
+                                        timeout=self.control.timeout(min(60, max(0.001, deadline - time.monotonic()))))
+            if response.status_code in (429, 500, 502, 503, 504, 524):
+                self.control.sleep(min(2 ** min(attempt, 4) + random.random(),
+                                       max(0.0, deadline - time.monotonic())))
                 continue
             self._check(response, path)
             found_files, found_sediments, _ = extract_references(response.json())
@@ -253,7 +263,7 @@ class WebImageBackend:
             append_unique(sediment_ids, found_sediments)
             if file_ids or sediment_ids:
                 return file_ids, sediment_ids
-            time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
+            self.control.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
         raise HelperError("ChatGPT 网页生图轮询超时", 504, "image_timeout")
 
     def download_images(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[bytes]:
@@ -261,19 +271,21 @@ class WebImageBackend:
         urls: list[str] = []
         for file_id in file_ids:
             path = f"/backend-api/files/{file_id}/download"
-            response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}), timeout=60)
+            response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
+                                        timeout=self.control.timeout(60))
             self._check(response, path)
             url = str(response.json().get("download_url") or response.json().get("url") or "")
             append_unique(urls, [url])
         for sediment_id in sediment_ids:
             path = f"/backend-api/conversation/{conversation_id}/attachment/{sediment_id}/download"
-            response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}), timeout=60)
+            response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
+                                        timeout=self.control.timeout(60))
             self._check(response, path)
             url = str(response.json().get("download_url") or response.json().get("url") or "")
             append_unique(urls, [url])
         images: list[bytes] = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
+            response = self.session.get(url, timeout=self.control.timeout(120))
             self._check(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
@@ -284,7 +296,7 @@ class WebImageBackend:
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.patch(self.base_url + path,
                                       headers=self._headers(path, {"Content-Type": "application/json"}),
-                                      json={"is_visible": False}, timeout=60)
+                                      json={"is_visible": False}, timeout=self.control.timeout(60))
         self._check(response, path)
 
 
@@ -294,10 +306,12 @@ def decode_data_url(value: str) -> bytes:
     return base64.b64decode(payload)
 
 
-def iter_sse_json(response: Any) -> Iterator[dict[str, Any]]:
+def iter_sse_json(response: Any, control: RequestControl | None = None) -> Iterator[dict[str, Any]]:
     """把 curl_cffi 流按 SSE data 帧解析为 JSON。"""
     lines: list[str] = []
     for raw in response.iter_lines():
+        if control is not None:
+            control.timeout()
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
         if not line:
             if lines:
@@ -362,4 +376,3 @@ def extract_conversation_id(value: Any) -> str:
             if found:
                 return found
     return ""
-
