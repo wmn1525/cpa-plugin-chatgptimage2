@@ -259,16 +259,15 @@ py -3.12 -m pip install -r requirements-helper.txt
 
 ## GitHub Releases
 
-The workflow at `.github/workflows/release.yml` builds Windows amd64 plus Linux amd64 and arm64 archives. Push a `v*` tag to create a GitHub Release:
+The workflow at `.github/workflows/release.yml` builds Windows amd64 plus Linux amd64 and arm64 archives. Push a release branch to start the build; the workflow creates the Git tag and GitHub Release after every asset has been verified:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git push origin HEAD:release/v0.1.0
 ```
 
-Do not create or publish the same Release manually before pushing the tag. The workflow creates a draft, uploads and verifies every asset, and publishes it only after all platform builds succeed.
+Do not push the `v0.1.0` tag or create the Release manually. The workflow creates a draft, uploads and verifies every asset, and publishes it together with the tag only after all platform builds succeed.
 
-Manual workflow runs create downloadable Actions artifacts but do not create a formal Release.
+Manual workflow runs create downloadable Actions artifacts but do not create a formal Release. The temporary `release/v0.1.0` branch may be deleted after publication.
 
 ## Tests
 

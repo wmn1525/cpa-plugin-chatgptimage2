@@ -259,16 +259,15 @@ py -3.12 -m pip install -r requirements-helper.txt
 
 ## GitHub Releases
 
-`.github/workflows/release.yml` 会构建 Windows amd64、Linux amd64 和 Linux arm64 压缩包。推送 `v*` 标签即可创建 GitHub Release：
+`.github/workflows/release.yml` 会构建 Windows amd64、Linux amd64 和 Linux arm64 压缩包。推送发布分支后开始构建，工作流会在全部附件校验通过后自行创建 Git 标签和 GitHub Release：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git push origin HEAD:release/v0.1.0
 ```
 
-推送标签前不要手工创建或发布同名 Release。工作流会先创建草稿，上传并校验全部附件，所有平台构建成功后才正式发布。
+不要自行推送 `v0.1.0` 标签，也不要手工创建同名 Release。工作流会先创建草稿，上传并校验全部附件，所有平台构建成功后再同时发布 Release 和标签。
 
-手动运行工作流只生成可下载的 Actions Artifacts，不创建正式 Release。
+手动运行工作流只生成可下载的 Actions Artifacts，不创建正式 Release。发布完成后可以删除临时的 `release/v0.1.0` 分支。
 
 ## 测试
 

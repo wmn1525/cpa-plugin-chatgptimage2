@@ -2,8 +2,8 @@ name: 发布插件
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - "release/v*"
   workflow_dispatch:
     inputs:
       version:
@@ -41,7 +41,8 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             VERSION="${INPUT_VERSION}"
           else
-            VERSION="${GITHUB_REF_NAME#v}"
+            RELEASE_REF="${GITHUB_REF_NAME#release/}"
+            VERSION="${RELEASE_REF#v}"
           fi
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -98,7 +99,8 @@ jobs:
           if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
               $version = $env:INPUT_VERSION
           } else {
-              $version = $env:GITHUB_REF_NAME.TrimStart("v")
+              $releaseRef = $env:GITHUB_REF_NAME -replace '^release/', ''
+              $version = $releaseRef.TrimStart("v")
           }
           "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -119,6 +121,14 @@ jobs:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-24.04
     steps:
+      - name: 计算发布标签
+        id: release
+        shell: bash
+        run: |
+          release_ref="${GITHUB_REF_NAME#release/}"
+          version="${release_ref#v}"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
       - name: 下载全部架构产物
         uses: actions/download-artifact@v4
         with:
@@ -136,23 +146,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            is_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')"
+          tag="${{ steps.release.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$tag" --json isDraft --jq '.isDraft')"
             if [[ "$is_draft" != "true" ]]; then
-              asset_count="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets | length')"
+              asset_count="$(gh release view "$tag" --json assets --jq '.assets | length')"
               if [[ "$asset_count" != "0" ]]; then
-                echo "Release ${GITHUB_REF_NAME} 已包含附件，拒绝覆盖。"
+                echo "Release $tag 已包含附件，拒绝覆盖。"
                 exit 1
               fi
-              echo "删除标签 Push 自动创建的空 Release，保留 Git 标签。"
-              gh release delete "${GITHUB_REF_NAME}" --yes
+              echo "Release $tag 已经发布但没有附件，拒绝覆盖。"
+              exit 1
             fi
           fi
 
-          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" \
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
               --draft \
-              --title "cpaimage ${GITHUB_REF_NAME}" \
+              --target "$GITHUB_SHA" \
+              --title "cpaimage $tag" \
               --generate-notes
           fi
 
@@ -161,6 +173,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          tag="${{ steps.release.outputs.tag }}"
           shopt -s nullglob
           files=(dist/*)
           if (( ${#files[@]} == 0 )); then
@@ -168,8 +181,8 @@ jobs:
             exit 1
           fi
 
-          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
-          remote_names="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
+          gh release upload "$tag" "${files[@]}" --clobber
+          remote_names="$(gh release view "$tag" --json assets --jq '.assets[].name')"
           for file in "${files[@]}"; do
             name="$(basename "$file")"
             if ! grep -Fxq "$name" <<<"$remote_names"; then
@@ -182,4 +195,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${GITHUB_REF_NAME}" --draft=false
+        run: gh release edit "${{ steps.release.outputs.tag }}" --draft=false
