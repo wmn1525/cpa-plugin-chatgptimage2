@@ -41,7 +41,8 @@ try {
     if (Test-Path $packageDir) { Remove-Item -LiteralPath $packageDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
     Copy-Item (Join-Path $dist "cpaimage.dll"), (Join-Path $dist "cpaimage-helper.exe"), `
-        (Join-Path $root "README.md"), (Join-Path $root "config.example.yaml"), `
+        (Join-Path $root "README.md"), (Join-Path $root "README_CN.md"), `
+        (Join-Path $root "config.example.yaml"), `
         (Join-Path $root "THIRD_PARTY_NOTICES.md"), (Join-Path $root "scripts\install.ps1"), `
         (Join-Path $root "scripts\setup-local-cpa.ps1") `
         -Destination $packageDir

@@ -58,10 +58,63 @@ jobs:
             dist/cpaimage_${{ steps.version.outputs.value }}_linux_${{ matrix.arch }}.zip
             dist/cpaimage_${{ steps.version.outputs.value }}_linux_${{ matrix.arch }}.tar.gz
 
+  build-windows:
+    name: 构建 Windows amd64
+    runs-on: windows-2025
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 配置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-helper.txt
+
+      - name: 配置 MinGW-w64
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: 安装 Python 依赖
+        shell: pwsh
+        run: py -3.12 -m pip install -r requirements-helper.txt
+
+      - name: 计算版本号
+        id: version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+              $version = $env:INPUT_VERSION
+          } else {
+              $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: 构建 Windows 发布包
+        shell: pwsh
+        run: ./scripts/build.ps1 -Version "${{ steps.version.outputs.value }}"
+
+      - name: 上传 Windows 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpaimage-windows-amd64
+          if-no-files-found: error
+          path: dist/cpaimage_${{ steps.version.outputs.value }}_windows_amd64.zip
+
   publish:
     name: 创建 GitHub Release
     if: github.event_name == 'push'
-    needs: build-linux
+    needs: [build-linux, build-windows]
     runs-on: ubuntu-24.04
     steps:
       - name: 下载全部架构产物
@@ -74,17 +127,50 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum cpaimage_*_linux_*.zip cpaimage_*_linux_*.tar.gz > SHA256SUMS
+          sha256sum cpaimage_*.zip cpaimage_*.tar.gz > SHA256SUMS
 
-      - name: 创建或更新 Release
+      - name: 准备 Draft Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+            is_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Release ${GITHUB_REF_NAME} 已经发布，无法安全追加构建附件。请使用新的版本标签。"
+              exit 1
+            fi
           else
-            gh release create "${GITHUB_REF_NAME}" dist/* \
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft \
               --title "cpaimage ${GITHUB_REF_NAME}" \
               --generate-notes
           fi
+
+      - name: 上传并校验 Release 资产
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*)
+          if (( ${#files[@]} == 0 )); then
+            echo "没有找到待发布文件。"
+            exit 1
+          fi
+
+          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
+          remote_names="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            if ! grep -Fxq "$name" <<<"$remote_names"; then
+              echo "Release 缺少资产：$name"
+              exit 1
+            fi
+          done
+
+      - name: 发布 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false

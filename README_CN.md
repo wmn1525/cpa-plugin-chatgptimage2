@@ -85,6 +85,7 @@ Release 页面：https://github.com/wmn1525/cpa-plugin-chatgptimage2/releases
 发布附件名称：
 
 ```text
+cpaimage_<版本>_windows_amd64.zip
 cpaimage_<版本>_linux_amd64.tar.gz
 cpaimage_<版本>_linux_amd64.zip
 cpaimage_<版本>_linux_arm64.tar.gz
@@ -156,7 +157,7 @@ pluginhost: plugin registered plugin_id=cpaimage
 
 ## Windows 安装
 
-在 Windows 发布目录中执行：
+从同一个 GitHub Release 下载并解压 `cpaimage_<版本>_windows_amd64.zip`，然后在发布目录中执行：
 
 ```powershell
 .\install.ps1 -CpaDir "C:\CLIProxyAPI"
@@ -258,12 +259,14 @@ py -3.12 -m pip install -r requirements-helper.txt
 
 ## GitHub Releases
 
-`.github/workflows/release.yml` 会构建 Linux amd64 和 arm64 压缩包。推送 `v*` 标签即可创建 GitHub Release：
+`.github/workflows/release.yml` 会构建 Windows amd64、Linux amd64 和 Linux arm64 压缩包。推送 `v*` 标签即可创建 GitHub Release：
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+推送标签前不要手工创建或发布同名 Release。工作流会先创建草稿，上传并校验全部附件，所有平台构建成功后才正式发布。
 
 手动运行工作流只生成可下载的 Actions Artifacts，不创建正式 Release。
 

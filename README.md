@@ -85,6 +85,7 @@ Release page: https://github.com/wmn1525/cpa-plugin-chatgptimage2/releases
 Release assets are named as follows:
 
 ```text
+cpaimage_<version>_windows_amd64.zip
 cpaimage_<version>_linux_amd64.tar.gz
 cpaimage_<version>_linux_amd64.zip
 cpaimage_<version>_linux_arm64.tar.gz
@@ -156,7 +157,7 @@ Do not use `docker cp` as the permanent installation method unless the container
 
 ## Windows Installation
 
-From a Windows release directory, run:
+Download and extract `cpaimage_<version>_windows_amd64.zip` from the same GitHub Release, then run:
 
 ```powershell
 .\install.ps1 -CpaDir "C:\CLIProxyAPI"
@@ -258,12 +259,14 @@ py -3.12 -m pip install -r requirements-helper.txt
 
 ## GitHub Releases
 
-The workflow at `.github/workflows/release.yml` builds Linux amd64 and arm64 archives. Push a `v*` tag to create a GitHub Release:
+The workflow at `.github/workflows/release.yml` builds Windows amd64 plus Linux amd64 and arm64 archives. Push a `v*` tag to create a GitHub Release:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+Do not create or publish the same Release manually before pushing the tag. The workflow creates a draft, uploads and verifies every asset, and publishes it only after all platform builds succeed.
 
 Manual workflow runs create downloadable Actions artifacts but do not create a formal Release.
 
