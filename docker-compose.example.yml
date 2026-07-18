@@ -1,0 +1,18 @@
+services:
+  cli-proxy-api:
+    # 从当前插件源码构建包含 Linux 插件的自定义 CPA 镜像。
+    build:
+      context: .
+      dockerfile: Dockerfile.cpaimage
+      args:
+        VERSION: "0.1.0"
+    image: local/cli-proxy-api-cpaimage:0.1.0
+    container_name: cli-proxy-api
+    ports:
+      - "8317:8317"
+    volumes:
+      - ./config.yaml:/CLIProxyAPI/config.yaml
+      - ./auths:/root/.cli-proxy-api
+      - ./logs:/CLIProxyAPI/logs
+    restart: unless-stopped
+

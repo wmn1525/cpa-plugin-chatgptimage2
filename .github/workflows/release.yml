@@ -1,0 +1,90 @@
+name: 发布插件
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "发布版本，例如 0.1.0"
+        required: true
+        default: "0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: 构建 Linux ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 配置 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: 配置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 计算版本号
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="${INPUT_VERSION}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建发布包
+        shell: pwsh
+        run: ./scripts/build-linux-release.ps1 -Version "${{ steps.version.outputs.value }}" -Arch "${{ matrix.arch }}"
+
+      - name: 上传架构产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpaimage-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            dist/cpaimage_${{ steps.version.outputs.value }}_linux_${{ matrix.arch }}.zip
+            dist/cpaimage_${{ steps.version.outputs.value }}_linux_${{ matrix.arch }}.tar.gz
+
+  publish:
+    name: 创建 GitHub Release
+    if: github.event_name == 'push'
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载全部架构产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成统一校验文件
+        shell: bash
+        run: |
+          cd dist
+          sha256sum cpaimage_*_linux_*.zip cpaimage_*_linux_*.tar.gz > SHA256SUMS
+
+      - name: 创建或更新 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* \
+              --title "cpaimage ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
