@@ -139,10 +139,17 @@ jobs:
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             is_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')"
             if [[ "$is_draft" != "true" ]]; then
-              echo "Release ${GITHUB_REF_NAME} 已经发布，无法安全追加构建附件。请使用新的版本标签。"
-              exit 1
+              asset_count="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets | length')"
+              if [[ "$asset_count" != "0" ]]; then
+                echo "Release ${GITHUB_REF_NAME} 已包含附件，拒绝覆盖。"
+                exit 1
+              fi
+              echo "删除标签 Push 自动创建的空 Release，保留 Git 标签。"
+              gh release delete "${GITHUB_REF_NAME}" --yes
             fi
-          else
+          fi
+
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release create "${GITHUB_REF_NAME}" \
               --draft \
               --title "cpaimage ${GITHUB_REF_NAME}" \
