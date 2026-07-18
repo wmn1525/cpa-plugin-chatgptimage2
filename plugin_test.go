@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"sync"
 	"testing"
@@ -25,6 +26,28 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.BaseURL != "http://127.0.0.1:9000" || cfg.RequestTimeout != 30*time.Second || cfg.CleanupConversation {
 		t.Fatalf("显式配置异常: %#v", cfg)
 	}
+}
+
+// TestTokenExpiresBefore 验证已过期、寿命不足和不透明 Token 的筛选语义。
+func TestTokenExpiresBefore(t *testing.T) {
+	now := time.Now()
+	shortToken := testJWT(now.Add(time.Minute).Unix())
+	longToken := testJWT(now.Add(time.Hour).Unix())
+	if !tokenExpiresBefore(shortToken, now.Add(2*time.Minute)) {
+		t.Fatal("寿命不足的 Token 应被跳过")
+	}
+	if tokenExpiresBefore(longToken, now.Add(2*time.Minute)) {
+		t.Fatal("寿命充足的 Token 不应被跳过")
+	}
+	if tokenExpiresBefore("opaque-token", now.Add(2*time.Minute)) {
+		t.Fatal("无法解析 exp 的 Token 应交给上游验证")
+	}
+}
+
+// testJWT 生成仅供过期时间单元测试使用的无签名 JWT。
+func testJWT(expiresAt int64) string {
+	payload := fmt.Sprintf(`{"exp":%d}`, expiresAt)
+	return "header." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".signature"
 }
 
 // TestReconfigureKeepsActiveHelper 验证重复配置和普通配置变化不会重启助手。

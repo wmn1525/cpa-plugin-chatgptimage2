@@ -35,10 +35,6 @@ type executionResult struct {
 
 // executeHelper 组装凭证和原始 Images API 请求并交给助手处理。
 func (p *imagePlugin) executeHelper(req rpcExecutorRequest) (executionResult, error) {
-	credentials, err := loadCredentials()
-	if err != nil {
-		return executionResult{}, err
-	}
 	cfg, helper, release := p.acquireHelper()
 	defer release()
 	if helper == nil {
@@ -51,7 +47,6 @@ func (p *imagePlugin) executeHelper(req rpcExecutorRequest) (executionResult, er
 		BodyBase64:          base64.StdEncoding.EncodeToString(req.Payload),
 		ContentType:         req.Headers.Get("Content-Type"),
 		Stream:              req.Stream,
-		Credentials:         credentials,
 		BaseURL:             cfg.BaseURL,
 		TimeoutSeconds:      int(cfg.RequestTimeout / time.Second),
 		ProxyURL:            cfg.ProxyURL,
@@ -59,7 +54,20 @@ func (p *imagePlugin) executeHelper(req rpcExecutorRequest) (executionResult, er
 		CleanupConversation: cfg.CleanupConversation,
 	}
 	var response helperExecutionResult
-	if err := helper.Call(ctx, "images", payload, &response); err != nil {
+	for attempt := 0; attempt < 2; attempt++ {
+		credentials, err := loadCredentials(cfg.RequestTimeout)
+		if err != nil {
+			return executionResult{}, err
+		}
+		payload.Credentials = credentials
+		err = helper.Call(ctx, "images", payload, &response)
+		if err == nil {
+			break
+		}
+		status, expired := err.(*statusError)
+		if attempt == 0 && expired && status.status == http.StatusUnauthorized {
+			continue
+		}
 		return executionResult{}, err
 	}
 	body, err := base64.StdEncoding.DecodeString(response.BodyBase64)

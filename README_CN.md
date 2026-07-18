@@ -187,6 +187,8 @@ C:\CLIProxyAPI\plugins\windows\amd64\cpaimage-helper.exe
 
 插件会在后续请求中自动发现新增或刷新的凭证。认证失败、限流和临时网络错误会触发换号及内存冷却。
 
+插件会解析 JWT 的 `exp`，只选择有效期能够覆盖 `request_timeout` 并额外保留 30 秒余量的凭证；无法解析 `exp` 的不透明 Token 仍交给上游验证。凭证在生成、轮询或下载过程中返回 401 时，助手会立即释放该凭证并换号。若当前请求快照中的凭证全部失效，DLL 会重新调用一次 CPA `auth.list/get`，让同一请求使用 CPA 刚刷新的 Token 重试。旧 Token 与新 Token 使用不同的内存冷却键。
+
 上传凭证不会重启助手。CPA 重复下发配置时继续使用当前助手；只有助手路径真正变化时，新请求才切换到新进程，旧进程会在全部在途生成完成后关闭。凭证忙碌时会立即跳过并尝试其他可用账号。
 
 ## API 示例
@@ -283,6 +285,15 @@ py -3.12 -m unittest -v tests.test_helper tests.test_helper_exe
 
 ```powershell
 .\scripts\integration-test.ps1
+```
+
+集成测试固定执行总计 100 个图片请求，并验证 100/100 成功、配置热重载、凭证热上传及凭证使用中返回 401 后自动换号。也可以对已运行的 CPA 单独执行压测：
+
+```powershell
+.\scripts\load-test.ps1 `
+  -BaseUrl "http://127.0.0.1:8317/v1" `
+  -ApiKey "你的_CPA_API_KEY" `
+  -Total 100 -Concurrency 20
 ```
 
 ## 致谢

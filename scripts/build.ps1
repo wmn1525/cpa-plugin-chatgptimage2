@@ -44,7 +44,7 @@ try {
         (Join-Path $root "README.md"), (Join-Path $root "README_CN.md"), `
         (Join-Path $root "config.example.yaml"), `
         (Join-Path $root "THIRD_PARTY_NOTICES.md"), (Join-Path $root "scripts\install.ps1"), `
-        (Join-Path $root "scripts\setup-local-cpa.ps1") `
+        (Join-Path $root "scripts\setup-local-cpa.ps1"), (Join-Path $root "scripts\load-test.ps1") `
         -Destination $packageDir
     $hashLines = Get-ChildItem $packageDir -File | ForEach-Object {
         $hash = Get-FileHash -Algorithm SHA256 $_.FullName

@@ -20,6 +20,9 @@ def main() -> int:
     server.generation_delay = max(0, args.generation_delay)
     server.auth_lock = threading.Lock()
     server.seen_authorizations = set()
+    server.first_authorization_digest = ""
+    server.expire_first_credential = False
+    server.expired_response_count = 0
     server.poll_lock = threading.Lock()
     server.poll_statuses = []
     server.serve_forever()

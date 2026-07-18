@@ -187,6 +187,8 @@ The credential must contain at least:
 
 The plugin discovers newly uploaded or refreshed credentials on subsequent requests. Authentication failures, rate limits, and temporary network errors trigger credential rotation and an in-memory cooldown.
 
+For JWT credentials, the plugin checks `exp` and only selects a token whose remaining lifetime covers `request_timeout` plus a 30-second margin. Opaque tokens without a parseable `exp` are still validated by the upstream. If a credential returns 401 during generation, polling, or download, the helper releases it immediately and switches accounts. If every credential in the request snapshot has expired, the DLL calls CPA `auth.list/get` once more so the same request can retry with a token CPA has just refreshed. Old and refreshed tokens use distinct in-memory cooldown keys.
+
 Credential uploads do not restart the helper. Repeated CPA configuration reloads keep the current helper, while a real helper-path change routes new requests to a new process and lets the old process finish all in-flight generations before shutdown. Busy credentials are skipped without blocking other available accounts.
 
 ## API Examples
@@ -283,6 +285,15 @@ The integration test starts a real CPA v7.2.86 process with a local mock ChatGPT
 
 ```powershell
 .\scripts\integration-test.ps1
+```
+
+The integration test always runs exactly 100 image requests and verifies 100/100 success, configuration hot reloads, credential hot uploads, and account rotation after a credential returns 401 while in use. To load-test an already running CPA instance:
+
+```powershell
+.\scripts\load-test.ps1 `
+  -BaseUrl "http://127.0.0.1:8317/v1" `
+  -ApiKey "YOUR_CPA_API_KEY" `
+  -Total 100 -Concurrency 20
 ```
 
 ## Acknowledgements

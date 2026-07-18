@@ -50,6 +50,20 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
         digest = hashlib.sha256(authorization.encode()).hexdigest()
         with self.server.auth_lock:
             self.server.seen_authorizations.add(digest)
+            if not self.server.first_authorization_digest:
+                self.server.first_authorization_digest = digest
+
+    def _credential_expired(self) -> bool:
+        """判断当前请求是否应模拟首个凭证在使用中失效。"""
+        if not self.server.expire_first_credential:
+            return False
+        authorization = self.headers.get("Authorization") or ""
+        digest = hashlib.sha256(authorization.encode()).hexdigest()
+        with self.server.auth_lock:
+            expired = bool(digest and digest == self.server.first_authorization_digest)
+            if expired:
+                self.server.expired_response_count += 1
+            return expired
 
     def do_GET(self) -> None:
         """处理首页、下载地址和图片响应。"""
@@ -71,6 +85,10 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
         elif self.path == "/__test__/auth-count":
             with self.server.auth_lock:
                 count = len(self.server.seen_authorizations)
+            self._json({"count": count})
+        elif self.path == "/__test__/expired-count":
+            with self.server.auth_lock:
+                count = self.server.expired_response_count
             self._json({"count": count})
         elif self.path.startswith("/backend-api/conversation/"):
             with self.server.poll_lock:
@@ -98,6 +116,9 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
         elif self.path == "/backend-api/f/conversation/prepare":
             self._json({"conduit_token": "conduit"})
         elif self.path == "/backend-api/f/conversation":
+            if self._credential_expired():
+                self._json({"expired": True}, 401)
+                return
             delay = float(getattr(self.server, "generation_delay", 0))
             if delay > 0:
                 time.sleep(delay)
@@ -113,6 +134,9 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
         elif self.path == "/backend-api/files":
             self._json({"file_id": "file_input", "upload_url": self.server.base_url + "/upload"})
         elif self.path == "/backend-api/files/file_input/uploaded":
+            self._json({"ok": True})
+        elif self.path == "/__test__/expire-first":
+            self.server.expire_first_credential = True
             self._json({"ok": True})
         else:
             self._json({}, 404)
@@ -147,6 +171,9 @@ class MockServer:
         self.server.poll_statuses = []
         self.server.auth_lock = threading.Lock()
         self.server.seen_authorizations = set()
+        self.server.first_authorization_digest = ""
+        self.server.expire_first_credential = False
+        self.server.expired_response_count = 0
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return self
@@ -324,6 +351,44 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(second["token"], "token-b")
         self.assertEqual(calls["token-a"], 1)
 
+    def test_expired_credential_switches_to_refreshed_token(self) -> None:
+        """使用中失效的旧 Token 应冷却，刷新后的新 Token 应立即可用。"""
+        credentials = [{"access_token": "expired-token"}, {"access_token": "backup-token"}]
+
+        def fake_generate(_request: ImageRequest, credential: dict, _settings: dict,
+                          _control: RequestControl) -> dict:
+            """模拟旧 Token 在 conversation 阶段返回 401。"""
+            if credential["access_token"] == "expired-token":
+                raise UpstreamError("expired", 401)
+            return {"token": credential["access_token"]}
+
+        with patch("helper.protocol.generate_with_credential", side_effect=fake_generate):
+            result = generate_one(ImageRequest("cat"), credentials, {"timeout_seconds": 1}, 0)
+        old_key = protocol.credential_key(credentials[0])
+        refreshed = {"access_token": "refreshed-token"}
+        self.assertEqual(result["token"], "backup-token")
+        self.assertTrue(protocol.credential_cooling(old_key))
+        self.assertFalse(protocol.credential_cooling(protocol.credential_key(refreshed)))
+
+        with patch("helper.protocol.generate_with_credential",
+                   return_value={"token": refreshed["access_token"]}):
+            result = generate_one(ImageRequest("cat"), [refreshed], {"timeout_seconds": 1}, 0)
+        self.assertEqual(result["token"], "refreshed-token")
+
+    def test_all_expired_credentials_preserve_401(self) -> None:
+        """全部快照凭证失效时应通知 DLL 重新读取 CPA 凭证。"""
+        def fake_generate(_request: ImageRequest, _credential: dict, _settings: dict,
+                          _control: RequestControl) -> dict:
+            """模拟唯一凭证在执行阶段失效。"""
+            raise UpstreamError("expired", 401)
+
+        with patch("helper.protocol.generate_with_credential", side_effect=fake_generate):
+            with self.assertRaises(HelperError) as caught:
+                generate_one(ImageRequest("cat"), [{"access_token": "expired"}],
+                             {"timeout_seconds": 1}, 0)
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(caught.exception.code, "credential_expired")
+
     def test_concurrent_requests_use_distinct_credentials(self) -> None:
         """高并发请求应并行使用不同账号且同账号不重入。"""
         credentials = [{"access_token": f"token-{index}"} for index in range(4)]
@@ -348,11 +413,11 @@ class HelperTests(unittest.TestCase):
             return {"token": token}
 
         with patch("helper.protocol.generate_with_credential", side_effect=fake_generate):
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=32) as executor:
                 futures = [executor.submit(generate_one, ImageRequest("cat"), credentials,
-                                           {"timeout_seconds": 2}, index) for index in range(8)]
+                                           {"timeout_seconds": 5}, index) for index in range(100)]
                 results = [future.result() for future in futures]
-        self.assertEqual(len(results), 8)
+        self.assertEqual(len(results), 100)
         self.assertEqual(overlap, [])
         self.assertGreaterEqual(peak, 2)
 

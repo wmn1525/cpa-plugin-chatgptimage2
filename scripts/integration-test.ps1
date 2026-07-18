@@ -54,7 +54,7 @@ $mock = $null
 $cpa = $null
 try {
     # 启动模拟 ChatGPT 与真实 CPA 进程。
-    $mock = Start-Process -FilePath "py" -ArgumentList "-3.12", "-m", "tests.mock_server_entry", "--port", "18081", "--generation-delay", "0.35" -WorkingDirectory $root -PassThru -WindowStyle Hidden
+    $mock = Start-Process -FilePath "py" -ArgumentList "-3.12", "-m", "tests.mock_server_entry", "--port", "18081", "--generation-delay", "0.05" -WorkingDirectory $root -PassThru -WindowStyle Hidden
     $cpa = Start-Process -FilePath $CpaExe -ArgumentList "--config", (Join-Path $runtime "config.yaml") -WorkingDirectory $runtime -RedirectStandardOutput (Join-Path $runtime "cpa.stdout.log") -RedirectStandardError (Join-Path $runtime "cpa.stderr.log") -PassThru -WindowStyle Hidden
 
     $ready = $false
@@ -80,40 +80,21 @@ try {
     # 热上传第二个凭证，后续请求应直接从 CPA 发现而无需重启插件。
     [IO.File]::WriteAllText((Join-Path $auth "mock2.json"), $authJson2.Trim(), $utf8NoBom)
     Start-Sleep -Seconds 2
+    Invoke-RestMethod "http://127.0.0.1:18081/__test__/expire-first" -Method Post | Out-Null
 
-    # 并发请求期间重复写入和变更配置，所有在途生成必须完成。
-    Add-Type -AssemblyName System.Net.Http
-    $client = [Net.Http.HttpClient]::new()
-    $client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", "integration-key")
-    $tasks = [Collections.Generic.List[Threading.Tasks.Task]]::new()
-    for ($index = 0; $index -lt 8; $index++) {
-        $concurrentBody = @{model="gpt-image-2"; prompt="并发猫-$index"; response_format="b64_json"} | ConvertTo-Json -Compress
-        $content = [Net.Http.StringContent]::new($concurrentBody, [Text.Encoding]::UTF8, "application/json")
-        $tasks.Add($client.PostAsync("http://127.0.0.1:18317/v1/images/generations", $content))
-    }
-    Start-Sleep -Milliseconds 300
-    [IO.File]::WriteAllText((Join-Path $runtime "config.yaml"), $configYaml, $utf8NoBom)
-    Start-Sleep -Milliseconds 300
-    $changedConfig = $configYaml.Replace("cleanup_conversation: true", "cleanup_conversation: false")
-    [IO.File]::WriteAllText((Join-Path $runtime "config.yaml"), $changedConfig, $utf8NoBom)
-    if (-not [Threading.Tasks.Task]::WaitAll($tasks.ToArray(), 30000)) {
-        throw "配置热切换期间并发请求未在超时内完成。"
-    }
-    foreach ($task in $tasks) {
-        $httpResponse = [Net.Http.HttpResponseMessage]$task.Result
-        $rawBody = $httpResponse.Content.ReadAsStringAsync().Result
-        if (-not $httpResponse.IsSuccessStatusCode) {
-            throw "配置热切换期间请求失败：HTTP $([int]$httpResponse.StatusCode) $rawBody"
-        }
-        $parsedBody = $rawBody | ConvertFrom-Json
-        if (-not $parsedBody.data[0].b64_json) {
-            throw "配置热切换期间请求未返回图片。"
-        }
-    }
-    $client.Dispose()
+    # 使用发布压测脚本完成严格 100 个请求，并在批次间反复热重载配置。
+    $concurrentTotal = 100
+    & (Join-Path $root "scripts\load-test.ps1") `
+        -BaseUrl "http://127.0.0.1:18317/v1" -ApiKey "integration-key" `
+        -Total $concurrentTotal -Concurrency 20 -TimeoutMinutes 2 `
+        -ConfigPath (Join-Path $runtime "config.yaml") -ReloadConfig
     $authCount = (Invoke-RestMethod "http://127.0.0.1:18081/__test__/auth-count").count
     if ($authCount -lt 2) {
         throw "并发请求未使用热上传的第二个 CPA 凭证。"
+    }
+    $expiredCount = (Invoke-RestMethod "http://127.0.0.1:18081/__test__/expired-count").count
+    if ($expiredCount -lt 1) {
+        throw "100 请求并发测试未触发凭证使用中失效换号。"
     }
 
     # 验证多图与流式请求均经过插件执行器。
@@ -138,7 +119,7 @@ try {
     if (-not $edit.data[0].b64_json) {
         throw "CPA 插件 multipart 编辑未返回图片。"
     }
-    Write-Output "CPA 集成测试通过：插件已加载并完成网页生图模拟链路。"
+    Write-Output "CPA 集成测试通过：完成 $concurrentTotal 个并发请求，并验证使用中凭证失效换号。"
 } finally {
     if ($cpa -and -not $cpa.HasExited) { Stop-Process -Id $cpa.Id -Force }
     if ($mock -and -not $mock.HasExited) { Stop-Process -Id $mock.Id -Force }
