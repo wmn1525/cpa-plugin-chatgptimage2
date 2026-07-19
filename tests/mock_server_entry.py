@@ -22,6 +22,7 @@ def main() -> int:
     server.seen_authorizations = set()
     server.first_authorization_digest = ""
     server.expire_first_credential = False
+    server.expire_credential_mode = "http"
     server.expired_response_count = 0
     server.poll_lock = threading.Lock()
     server.poll_statuses = []

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -151,6 +153,16 @@ func TestRouteModel(t *testing.T) {
 // TestRegistration 验证插件注册能力与格式声明。
 func TestRegistration(t *testing.T) {
 	registration := registrationInfo()
+	expectedVersion := os.Getenv("CPAIMAGE_EXPECT_VERSION")
+	if expectedVersion == "" {
+		expectedVersion = "dev"
+	}
+	if registration.Metadata.Version != expectedVersion || registration.Metadata.Author != "wmn1525" {
+		t.Fatalf("开发构建元数据异常: %#v", registration.Metadata)
+	}
+	if registration.Metadata.GitHubRepository != pluginRepositoryURL {
+		t.Fatalf("GitHubRepository = %q, want %q", registration.Metadata.GitHubRepository, pluginRepositoryURL)
+	}
 	if !registration.Capabilities.ModelRouter || !registration.Capabilities.Executor {
 		t.Fatal("缺少路由或执行器能力")
 	}
@@ -166,5 +178,26 @@ func TestRegistration(t *testing.T) {
 func TestMetadataString(t *testing.T) {
 	if value := metadataString(map[string]any{"request_path": "/v1/images/generations"}, "request_path"); value != "/v1/images/generations" {
 		t.Fatalf("metadataString() = %q", value)
+	}
+}
+
+// TestHasRefreshedCredential 验证只有新 Token 才触发第二次完整生成。
+func TestHasRefreshedCredential(t *testing.T) {
+	previous := []helperCredential{{AccessToken: "old-a"}, {AccessToken: "old-b"}}
+	if hasRefreshedCredential(previous, []helperCredential{{AccessToken: "old-b"}}) {
+		t.Fatal("仅删除旧凭证不应被视为 Token 刷新")
+	}
+	if !hasRefreshedCredential(previous, []helperCredential{{AccessToken: "new-a"}}) {
+		t.Fatal("新 Token 应被识别为已刷新凭证")
+	}
+}
+
+// TestRemainingTimeoutSeconds 验证助手重试只获得原请求剩余时间。
+func TestRemainingTimeoutSeconds(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	seconds := remainingTimeoutSeconds(ctx)
+	if seconds < 1 || seconds > 2 {
+		t.Fatalf("remainingTimeoutSeconds() = %d, want 1..2", seconds)
 	}
 }

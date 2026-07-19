@@ -12,11 +12,12 @@ import (
 )
 
 const (
-	pluginName = "cpaimage"
-	pluginID   = "cpaimage"
+	pluginName          = "cpaimage"
+	pluginID            = "cpaimage"
+	pluginRepositoryURL = "https://github.com/wmn1525/cpa-plugin-chatgptimage2"
 )
 
-var pluginVersion = "0.1.0"
+var pluginVersion = "dev"
 
 type imagePlugin struct {
 	mu     sync.RWMutex
@@ -182,15 +183,15 @@ func registrationInfo() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             "CPA ChatGPT 网页生图",
 			Version:          pluginVersion,
-			Author:           "cpaimage",
-			GitHubRepository: "https://github.com/wmn1525/cpa-plugin-chatgptimage2",
+			Author:           "wmn1525",
+			GitHubRepository: pluginRepositoryURL,
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "base_url", Type: pluginapi.ConfigFieldTypeString, Description: "ChatGPT 网页上游地址。"},
 				{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "单次生图总超时，例如 20m。"},
 				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "可选 HTTP/HTTPS/SOCKS5 代理。"},
 				{Name: "cf_cookies", Type: pluginapi.ConfigFieldTypeString, Description: "可选 Cloudflare Cookie 字符串。"},
 				{Name: "cleanup_conversation", Type: pluginapi.ConfigFieldTypeBoolean, Description: "成功后删除网页生图会话。"},
-				{Name: "helper_path", Type: pluginapi.ConfigFieldTypeString, Description: "助手 EXE 的绝对或工作目录相对路径。"},
+				{Name: "helper_path", Type: pluginapi.ConfigFieldTypeString, Description: "外部助手可执行文件的绝对或工作目录相对路径。"},
 			},
 		},
 		Capabilities: capabilities{

@@ -20,16 +20,16 @@
 
 ## 组件
 
-- `cpaimage.dll` / `cpaimage.so`：负责路由、凭证读取和助手进程管理的 CPA 动态库插件。
-- `cpaimage-helper.exe` / `cpaimage-helper`：包含 ChatGPT 网页请求实现和 Python 运行时依赖的独立助手。
+- `cpaimage.dll` / `cpaimage.so`：自包含 CPA 动态库；首次请求时会把内嵌助手校验并释放到用户缓存目录。
+- `cpaimage-helper.exe` / `cpaimage-helper`：仅源码构建和高级覆盖时使用，商店安装不需要此文件。
 
 ## 支持平台
 
-| 平台 | 架构 | 插件 | 助手 |
-|---|---|---|---|
-| Windows | amd64 | `cpaimage.dll` | `cpaimage-helper.exe` |
-| Linux | amd64 | `cpaimage.so` | `cpaimage-helper` |
-| Linux | arm64 | `cpaimage.so` | `cpaimage-helper` |
+| 平台 | 架构 | 商店安装文件 |
+|---|---|---|
+| Windows | amd64 | `cpaimage.dll` |
+| Linux | amd64 | `cpaimage.so` |
+| Linux | arm64 | `cpaimage.so` |
 
 要求 CPA v7.2.86 或更新版本。Linux 发布包面向与 Debian Bookworm glibc 兼容的环境，包括 CPA 官方 Docker 镜像。
 
@@ -48,16 +48,9 @@ plugins:
       proxy_url: ""
       cf_cookies: ""
       cleanup_conversation: true
-      helper_path: "/CLIProxyAPI/plugins/linux/amd64/cpaimage-helper"
 ```
 
-Linux arm64 将 `helper_path` 改为：
-
-```yaml
-helper_path: "/CLIProxyAPI/plugins/linux/arm64/cpaimage-helper"
-```
-
-Windows 使用绝对路径，例如：
+普通用户无需配置 `helper_path`。只有调试外部助手时才设置绝对路径，例如：
 
 ```yaml
 helper_path: "C:/CLIProxyAPI/plugins/windows/amd64/cpaimage-helper.exe"
@@ -74,9 +67,13 @@ helper_path: "C:/CLIProxyAPI/plugins/windows/amd64/cpaimage-helper.exe"
 | `proxy_url` | string | 空 | HTTP、HTTPS 或 SOCKS5 代理。 |
 | `cf_cookies` | string | 空 | 可选 Cloudflare Cookie 字符串。 |
 | `cleanup_conversation` | boolean | `true` | 成功后清理对应网页会话。 |
-| `helper_path` | string | 自动查找 | 助手的绝对路径或工作目录相对路径。 |
+| `helper_path` | string | 内嵌助手 | 高级覆盖项：外部助手的绝对路径或工作目录相对路径。 |
 
 凭证自身的 `proxy_url` 优先于插件全局代理。
+
+## CPA 插件商店安装
+
+插件进入官方商店后，在 CPA 管理页面搜索 `cpaimage` 并点击安装即可。安装器会写入 `cpaimage-v0.1.8.dll` 或 `cpaimage-v0.1.8.so`；安装完成后完全重启 CPA。若商店暂未显示该条目，请使用下面的 GitHub Release 安装方式。
 
 ## 从 GitHub Release 安装到 Linux Docker
 
@@ -85,13 +82,13 @@ Release 页面：https://github.com/wmn1525/cpa-plugin-chatgptimage2/releases
 发布附件名称：
 
 ```text
-cpaimage_<版本>_windows_amd64.zip
-cpaimage_<版本>_linux_amd64.tar.gz
-cpaimage_<版本>_linux_amd64.zip
-cpaimage_<版本>_linux_arm64.tar.gz
-cpaimage_<版本>_linux_arm64.zip
-SHA256SUMS
+cpaimage_0.1.8_windows_amd64.zip
+cpaimage_0.1.8_linux_amd64.zip
+cpaimage_0.1.8_linux_arm64.zip
+checksums.txt
 ```
+
+ZIP 根目录只有动态库；助手已嵌入。Linux `tar.gz` 仍可作为手动安装附件。
 
 ### 1. 挂载持久化插件目录
 
@@ -111,7 +108,7 @@ services:
 
 ```bash
 REPO="wmn1525/cpa-plugin-chatgptimage2"
-VERSION="0.1.0"
+VERSION="0.1.8"
 
 case "$(uname -m)" in
   x86_64) ARCH="amd64" ;;
@@ -126,16 +123,17 @@ curl -fL \
   "https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}" \
   -o "/tmp/${ASSET}"
 curl -fL \
-  "https://github.com/${REPO}/releases/download/v${VERSION}/SHA256SUMS" \
-  -o /tmp/SHA256SUMS
+  "https://github.com/${REPO}/releases/download/v${VERSION}/checksums.txt" \
+  -o /tmp/checksums.txt
 
 cd /tmp
-grep " ${ASSET}$" SHA256SUMS | sha256sum -c -
+grep " ${ASSET}$" checksums.txt | sha256sum -c -
 cd -
 
+rm -f "./plugins/linux/${ARCH}"/cpaimage-v*.so \
+      "./plugins/linux/${ARCH}/cpaimage-helper"
 tar -xzf "/tmp/${ASSET}" -C "./plugins/linux/${ARCH}"
-chmod 0755 "./plugins/linux/${ARCH}/cpaimage.so" \
-           "./plugins/linux/${ARCH}/cpaimage-helper"
+chmod 0755 "./plugins/linux/${ARCH}/cpaimage.so"
 ```
 
 ### 3. 重启 CPA
@@ -157,20 +155,23 @@ pluginhost: plugin registered plugin_id=cpaimage
 
 ## Windows 安装
 
-从同一个 GitHub Release 下载并解压 `cpaimage_<版本>_windows_amd64.zip`，然后在发布目录中执行：
+从同一个 GitHub Release 下载并解压 `cpaimage_0.1.8_windows_amd64.zip`。ZIP 根目录只有 `cpaimage.dll`，可在解压目录执行：
 
 ```powershell
-.\install.ps1 -CpaDir "C:\CLIProxyAPI"
+$target = "C:\CLIProxyAPI\plugins\windows\amd64"
+New-Item -ItemType Directory -Force $target | Out-Null
+Get-ChildItem $target -Filter "cpaimage-v*.dll" -File | Remove-Item -Force
+Remove-Item "$target\cpaimage-helper.exe" -Force -ErrorAction SilentlyContinue
+Copy-Item ".\cpaimage.dll" $target -Force
 ```
 
 文件会安装到：
 
 ```text
 C:\CLIProxyAPI\plugins\windows\amd64\cpaimage.dll
-C:\CLIProxyAPI\plugins\windows\amd64\cpaimage-helper.exe
 ```
 
-把 Windows `helper_path` 配置合并到 CPA 后重启。
+仓库中的 `scripts/install.ps1` 可执行相同操作。必须先清理残留版本文件，再完全重启 CPA；无需配置 `helper_path`。
 
 ## 凭证管理
 
@@ -236,16 +237,16 @@ curl http://127.0.0.1:8317/v1/images/edits \
 需要 Docker Desktop 或带 Buildx 的 Docker Engine：
 
 ```powershell
-.\scripts\build-linux-release.ps1 -Version "0.1.0" -Arch "all"
+.\scripts\build-linux-release.ps1 -Version "0.1.8" -Arch "all"
 ```
 
 只构建一个架构：
 
 ```powershell
-.\scripts\build-linux-release.ps1 -Version "0.1.0" -Arch "amd64"
+.\scripts\build-linux-release.ps1 -Version "0.1.8" -Arch "amd64"
 ```
 
-压缩包和 `SHA256SUMS` 会写入 `dist/`。
+压缩包和 `checksums.txt` 会写入 `dist/`。
 
 ### Windows 构建
 
@@ -258,7 +259,7 @@ curl http://127.0.0.1:8317/v1/images/edits \
 
 ```powershell
 py -3.12 -m pip install -r requirements-helper.txt
-.\scripts\build.ps1 -Version "0.1.0"
+.\scripts\build.ps1 -Version "0.1.8"
 ```
 
 ## GitHub Releases
@@ -266,12 +267,12 @@ py -3.12 -m pip install -r requirements-helper.txt
 `.github/workflows/release.yml` 会构建 Windows amd64、Linux amd64 和 Linux arm64 压缩包。推送发布分支后开始构建，工作流会在全部附件校验通过后自行创建 Git 标签和 GitHub Release：
 
 ```bash
-git push origin HEAD:release/v0.1.0
+git push origin HEAD:release/v0.1.8
 ```
 
-不要自行推送 `v0.1.0` 标签，也不要手工创建同名 Release。工作流会先创建草稿，上传并校验全部附件，所有平台构建成功后再同时发布 Release 和标签。
+不要自行推送 `v0.1.8` 标签，也不要手工创建同名 Release。工作流会先创建草稿，上传并校验全部附件，所有平台构建成功后再同时发布 Release 和标签。
 
-手动运行工作流只生成可下载的 Actions Artifacts，不创建正式 Release。发布完成后可以删除临时的 `release/v0.1.0` 分支。
+手动运行工作流只生成可下载的 Actions Artifacts，不创建正式 Release。发布完成后可以删除临时的 `release/v0.1.8` 分支。
 
 ## 测试
 
@@ -309,6 +310,6 @@ py -3.12 -m unittest -v tests.test_helper tests.test_helper_exe
 
 ## 卸载
 
-从对应平台的插件目录删除 `cpaimage.dll`/`cpaimage.so` 和助手文件，移除 CPA 配置中的 `plugins.configs.cpaimage`，然后重启 CPA。
+从对应平台的插件目录删除 `cpaimage.dll`/`cpaimage.so`、`cpaimage-v*.dll`/`cpaimage-v*.so` 和旧助手文件，移除 CPA 配置中的 `plugins.configs.cpaimage`，然后重启 CPA。
 
-其他第三方来源和声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目使用 [MIT License](LICENSE)。其他第三方来源和声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

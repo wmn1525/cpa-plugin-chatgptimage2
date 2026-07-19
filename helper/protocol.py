@@ -143,6 +143,7 @@ def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], setti
     control = control or RequestControl(float(settings.get("timeout_seconds") or 30))
     ordered = rotate_credentials(credentials, index)
     errors: list[str] = []
+    failure_statuses: list[int] = []
     last_error: HelperError | None = None
     attempted: set[str] = set()
     while len(attempted) < len({credential_key(item) for item in ordered}) and not control.expired():
@@ -169,6 +170,7 @@ def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], setti
                 return generate_with_credential(request, credential, settings, control)
             except UpstreamError as exc:
                 errors.append(str(exc))
+                failure_statuses.append(exc.status_code)
                 last_error = exc
                 if exc.status_code in (401, 403):
                     set_credential_cooldown(key, 300)
@@ -178,6 +180,7 @@ def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], setti
                     set_credential_cooldown(key, 30)
             except HelperError as exc:
                 errors.append(str(exc))
+                failure_statuses.append(exc.status_code)
                 last_error = exc
             except Exception as exc:
                 errors.append(str(exc))
@@ -191,7 +194,7 @@ def generate_one(request: ImageRequest, credentials: list[dict[str, Any]], setti
             break
     if control.expired():
         raise HelperError("等待可用 CPA 凭证或网页生图执行超时", 504, "image_timeout")
-    if last_error is not None and last_error.status_code == 401:
+    if failure_statuses and all(status in (401, 403) for status in failure_statuses):
         raise HelperError(str(last_error), 401, "credential_expired")
     raise HelperError(errors[-1] if errors else "全部 CPA 凭证均忙碌或不可用", 503, "all_credentials_failed")
 

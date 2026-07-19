@@ -20,16 +20,16 @@ Repository: https://github.com/wmn1525/cpa-plugin-chatgptimage2
 
 ## Components
 
-- `cpaimage.dll` / `cpaimage.so`: CPA dynamic-library plugin for routing, credential access, and helper process management.
-- `cpaimage-helper.exe` / `cpaimage-helper`: standalone helper containing the ChatGPT web request implementation and Python runtime dependencies.
+- `cpaimage.dll` / `cpaimage.so`: self-contained CPA library that verifies and extracts its embedded helper to the user cache on first use.
+- `cpaimage-helper.exe` / `cpaimage-helper`: used only for source builds and advanced overrides; store installations do not need this file.
 
 ## Supported Platforms
 
-| Platform | Architecture | Plugin | Helper |
-|---|---|---|---|
-| Windows | amd64 | `cpaimage.dll` | `cpaimage-helper.exe` |
-| Linux | amd64 | `cpaimage.so` | `cpaimage-helper` |
-| Linux | arm64 | `cpaimage.so` | `cpaimage-helper` |
+| Platform | Architecture | Store file |
+|---|---|---|
+| Windows | amd64 | `cpaimage.dll` |
+| Linux | amd64 | `cpaimage.so` |
+| Linux | arm64 | `cpaimage.so` |
 
 CPA v7.2.86 or later is required. Linux release binaries target Debian Bookworm-compatible glibc environments, including the official CPA Docker image.
 
@@ -48,16 +48,9 @@ plugins:
       proxy_url: ""
       cf_cookies: ""
       cleanup_conversation: true
-      helper_path: "/CLIProxyAPI/plugins/linux/amd64/cpaimage-helper"
 ```
 
-For Linux arm64, change `helper_path` to:
-
-```yaml
-helper_path: "/CLIProxyAPI/plugins/linux/arm64/cpaimage-helper"
-```
-
-For Windows, use an absolute path such as:
+Normal installations do not set `helper_path`. Set an absolute path only when debugging an external helper, for example:
 
 ```yaml
 helper_path: "C:/CLIProxyAPI/plugins/windows/amd64/cpaimage-helper.exe"
@@ -74,9 +67,13 @@ helper_path: "C:/CLIProxyAPI/plugins/windows/amd64/cpaimage-helper.exe"
 | `proxy_url` | string | empty | HTTP, HTTPS, or SOCKS5 proxy. |
 | `cf_cookies` | string | empty | Optional Cloudflare cookie string. |
 | `cleanup_conversation` | boolean | `true` | Removes the generated web conversation after success. |
-| `helper_path` | string | auto-detect | Absolute or working-directory-relative helper path. |
+| `helper_path` | string | embedded helper | Advanced override: absolute or working-directory-relative external helper path. |
 
 A credential-level `proxy_url` takes precedence over the global plugin proxy.
+
+## CPA Plugin Store
+
+Once the entry is available in the official store, search for `cpaimage` in CPA Management and click Install. The installer writes `cpaimage-v0.1.8.dll` or `cpaimage-v0.1.8.so`; fully restart CPA after installation. Use the GitHub Release instructions below while the store entry is pending.
 
 ## Linux Docker Installation from GitHub Releases
 
@@ -85,13 +82,13 @@ Release page: https://github.com/wmn1525/cpa-plugin-chatgptimage2/releases
 Release assets are named as follows:
 
 ```text
-cpaimage_<version>_windows_amd64.zip
-cpaimage_<version>_linux_amd64.tar.gz
-cpaimage_<version>_linux_amd64.zip
-cpaimage_<version>_linux_arm64.tar.gz
-cpaimage_<version>_linux_arm64.zip
-SHA256SUMS
+cpaimage_0.1.8_windows_amd64.zip
+cpaimage_0.1.8_linux_amd64.zip
+cpaimage_0.1.8_linux_arm64.zip
+checksums.txt
 ```
+
+Each ZIP contains only the platform library at its root; the helper is embedded. Linux `tar.gz` files may remain available for manual installation.
 
 ### 1. Mount a Persistent Plugin Directory
 
@@ -111,7 +108,7 @@ services:
 
 ```bash
 REPO="wmn1525/cpa-plugin-chatgptimage2"
-VERSION="0.1.0"
+VERSION="0.1.8"
 
 case "$(uname -m)" in
   x86_64) ARCH="amd64" ;;
@@ -126,16 +123,17 @@ curl -fL \
   "https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}" \
   -o "/tmp/${ASSET}"
 curl -fL \
-  "https://github.com/${REPO}/releases/download/v${VERSION}/SHA256SUMS" \
-  -o /tmp/SHA256SUMS
+  "https://github.com/${REPO}/releases/download/v${VERSION}/checksums.txt" \
+  -o /tmp/checksums.txt
 
 cd /tmp
-grep " ${ASSET}$" SHA256SUMS | sha256sum -c -
+grep " ${ASSET}$" checksums.txt | sha256sum -c -
 cd -
 
+rm -f "./plugins/linux/${ARCH}"/cpaimage-v*.so \
+      "./plugins/linux/${ARCH}/cpaimage-helper"
 tar -xzf "/tmp/${ASSET}" -C "./plugins/linux/${ARCH}"
-chmod 0755 "./plugins/linux/${ARCH}/cpaimage.so" \
-           "./plugins/linux/${ARCH}/cpaimage-helper"
+chmod 0755 "./plugins/linux/${ARCH}/cpaimage.so"
 ```
 
 ### 3. Restart CPA
@@ -157,20 +155,23 @@ Do not use `docker cp` as the permanent installation method unless the container
 
 ## Windows Installation
 
-Download and extract `cpaimage_<version>_windows_amd64.zip` from the same GitHub Release, then run:
+Download and extract `cpaimage_0.1.8_windows_amd64.zip`. The ZIP contains only `cpaimage.dll`; run the following from the extracted directory:
 
 ```powershell
-.\install.ps1 -CpaDir "C:\CLIProxyAPI"
+$target = "C:\CLIProxyAPI\plugins\windows\amd64"
+New-Item -ItemType Directory -Force $target | Out-Null
+Get-ChildItem $target -Filter "cpaimage-v*.dll" -File | Remove-Item -Force
+Remove-Item "$target\cpaimage-helper.exe" -Force -ErrorAction SilentlyContinue
+Copy-Item ".\cpaimage.dll" $target -Force
 ```
 
 The files are installed to:
 
 ```text
 C:\CLIProxyAPI\plugins\windows\amd64\cpaimage.dll
-C:\CLIProxyAPI\plugins\windows\amd64\cpaimage-helper.exe
 ```
 
-Merge the Windows `helper_path` configuration into CPA and restart it.
+The repository's `scripts/install.ps1` performs the same operation. Stale versioned files must be removed before a full CPA restart. No `helper_path` is required.
 
 ## Credential Management
 
@@ -236,16 +237,16 @@ The web flow normally emits one final `image.generation.result` SSE event after 
 Docker Desktop or Docker Engine with Buildx is required:
 
 ```powershell
-.\scripts\build-linux-release.ps1 -Version "0.1.0" -Arch "all"
+.\scripts\build-linux-release.ps1 -Version "0.1.8" -Arch "all"
 ```
 
 Build one architecture only:
 
 ```powershell
-.\scripts\build-linux-release.ps1 -Version "0.1.0" -Arch "amd64"
+.\scripts\build-linux-release.ps1 -Version "0.1.8" -Arch "amd64"
 ```
 
-Packages and `SHA256SUMS` are written to `dist/`.
+Packages and `checksums.txt` are written to `dist/`.
 
 ### Windows Build
 
@@ -258,7 +259,7 @@ Requirements:
 
 ```powershell
 py -3.12 -m pip install -r requirements-helper.txt
-.\scripts\build.ps1 -Version "0.1.0"
+.\scripts\build.ps1 -Version "0.1.8"
 ```
 
 ## GitHub Releases
@@ -266,12 +267,12 @@ py -3.12 -m pip install -r requirements-helper.txt
 The workflow at `.github/workflows/release.yml` builds Windows amd64 plus Linux amd64 and arm64 archives. Push a release branch to start the build; the workflow creates the Git tag and GitHub Release after every asset has been verified:
 
 ```bash
-git push origin HEAD:release/v0.1.0
+git push origin HEAD:release/v0.1.8
 ```
 
-Do not push the `v0.1.0` tag or create the Release manually. The workflow creates a draft, uploads and verifies every asset, and publishes it together with the tag only after all platform builds succeed.
+Do not push the `v0.1.8` tag or create the Release manually. The workflow creates a draft, uploads and verifies every asset, and publishes it together with the tag only after all platform builds succeed.
 
-Manual workflow runs create downloadable Actions artifacts but do not create a formal Release. The temporary `release/v0.1.0` branch may be deleted after publication.
+Manual workflow runs create downloadable Actions artifacts but do not create a formal Release. The temporary `release/v0.1.8` branch may be deleted after publication.
 
 ## Tests
 
@@ -309,6 +310,6 @@ The ChatGPT web request sequence, Sentinel/PoW implementation, upload flow, and 
 
 ## Uninstall
 
-Remove `cpaimage.dll`/`cpaimage.so` and the matching helper from the platform plugin directory, remove `plugins.configs.cpaimage` from CPA configuration, and restart CPA.
+Remove `cpaimage.dll`/`cpaimage.so`, `cpaimage-v*.dll`/`cpaimage-v*.so`, and any old helper from the platform plugin directory, remove `plugins.configs.cpaimage` from CPA configuration, and restart CPA.
 
-Additional third-party sources and notices are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+This project uses the [MIT License](LICENSE). Additional third-party sources and notices are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

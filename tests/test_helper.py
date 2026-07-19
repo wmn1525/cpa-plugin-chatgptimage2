@@ -117,6 +117,15 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
             self._json({"conduit_token": "conduit"})
         elif self.path == "/backend-api/f/conversation":
             if self._credential_expired():
+                if self.server.expire_credential_mode == "sse":
+                    payload = {"type": "error", "error": {"code": "token_invalidated"}}
+                    raw = ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
                 self._json({"expired": True}, 401)
                 return
             delay = float(getattr(self.server, "generation_delay", 0))
@@ -137,6 +146,11 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif self.path == "/__test__/expire-first":
             self.server.expire_first_credential = True
+            self.server.expire_credential_mode = "http"
+            self._json({"ok": True})
+        elif self.path == "/__test__/expire-first-sse":
+            self.server.expire_first_credential = True
+            self.server.expire_credential_mode = "sse"
             self._json({"ok": True})
         else:
             self._json({}, 404)
@@ -173,6 +187,7 @@ class MockServer:
         self.server.seen_authorizations = set()
         self.server.first_authorization_digest = ""
         self.server.expire_first_credential = False
+        self.server.expire_credential_mode = "http"
         self.server.expired_response_count = 0
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -385,6 +400,20 @@ class HelperTests(unittest.TestCase):
         with patch("helper.protocol.generate_with_credential", side_effect=fake_generate):
             with self.assertRaises(HelperError) as caught:
                 generate_one(ImageRequest("cat"), [{"access_token": "expired"}],
+                             {"timeout_seconds": 1}, 0)
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(caught.exception.code, "credential_expired")
+
+    def test_all_forbidden_credentials_are_treated_as_expired(self) -> None:
+        """全部凭证返回 403 时也应通知 DLL 重新读取 CPA 快照。"""
+        def fake_generate(_request: ImageRequest, _credential: dict, _settings: dict,
+                          _control: RequestControl) -> dict:
+            """模拟上游拒绝已失效的 OAuth 凭证。"""
+            raise UpstreamError("forbidden", 403)
+
+        with patch("helper.protocol.generate_with_credential", side_effect=fake_generate):
+            with self.assertRaises(HelperError) as caught:
+                generate_one(ImageRequest("cat"), [{"access_token": "forbidden"}],
                              {"timeout_seconds": 1}, 0)
         self.assertEqual(caught.exception.status_code, 401)
         self.assertEqual(caught.exception.code, "credential_expired")

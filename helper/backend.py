@@ -23,6 +23,11 @@ from helper.turnstile import solve_turnstile_token
 FILE_SERVICE_RE = re.compile(r"file-service://([A-Za-z0-9_-]+)")
 FILE_ID_RE = re.compile(r"\b(file_00000000[a-f0-9]{24})\b")
 SEDIMENT_RE = re.compile(r"sediment://([A-Za-z0-9_-]+)")
+INVALID_TOKEN_PATTERNS = (
+    "token_invalidated", "token_revoked", "authentication token has been invalidated",
+    "invalidated oauth token", "invalid_access_token",
+)
+ERROR_FIELD_NAMES = {"error", "errors", "code", "detail", "status_message"}
 
 
 @dataclass
@@ -258,7 +263,10 @@ class WebImageBackend:
                                        max(0.0, deadline - time.monotonic())))
                 continue
             self._check(response, path)
-            found_files, found_sediments, _ = extract_references(response.json())
+            payload = response.json()
+            if contains_invalid_token_error(payload):
+                raise UpstreamError("CPA 凭证在图片轮询阶段失效", 401, False)
+            found_files, found_sediments, _ = extract_references(payload)
             append_unique(file_ids, found_files)
             append_unique(sediment_ids, found_sediments)
             if file_ids or sediment_ids:
@@ -321,11 +329,36 @@ def iter_sse_json(response: Any, control: RequestControl | None = None) -> Itera
                     try:
                         value = json.loads(payload)
                     except json.JSONDecodeError:
+                        if contains_invalid_token_text(payload):
+                            raise UpstreamError("CPA 凭证在 SSE 阶段失效", 401, False)
                         continue
                     if isinstance(value, dict):
+                        if contains_invalid_token_error(value):
+                            raise UpstreamError("CPA 凭证在 SSE 阶段失效", 401, False)
                         yield value
         elif line.startswith("data:"):
             lines.append(line[5:].lstrip())
+
+
+def contains_invalid_token_text(value: str) -> bool:
+    """检查上游错误文本是否明确表示 OAuth Token 已失效。"""
+    lowered = str(value or "").lower()
+    return any(pattern in lowered for pattern in INVALID_TOKEN_PATTERNS)
+
+
+def contains_invalid_token_error(value: Any, error_context: bool = False) -> bool:
+    """只在结构化错误字段内递归识别 Token 失效，避免误判用户提示词。"""
+    if isinstance(value, str):
+        return error_context and contains_invalid_token_text(value)
+    if isinstance(value, dict):
+        event_error = str(value.get("type") or "").lower() in {"error", "conversation.error"}
+        for key, child in value.items():
+            child_context = error_context or event_error or str(key).lower() in ERROR_FIELD_NAMES
+            if contains_invalid_token_error(child, child_context):
+                return True
+    elif isinstance(value, list):
+        return any(contains_invalid_token_error(child, error_context) for child in value)
+    return False
 
 
 def append_unique(target: list[str], values: list[str]) -> None:

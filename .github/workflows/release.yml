@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "发布版本，例如 0.1.0"
+        description: "发布版本，例如 0.1.8"
         required: true
-        default: "0.1.0"
+        default: "0.1.8"
 
 permissions:
   contents: write
@@ -142,7 +142,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum cpaimage_*.zip cpaimage_*.tar.gz > SHA256SUMS
+          sha256sum cpaimage_*.zip cpaimage_*.tar.gz > checksums.txt
 
       - name: 准备 Draft Release
         shell: bash

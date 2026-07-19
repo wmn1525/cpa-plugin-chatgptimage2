@@ -25,7 +25,6 @@ if (-not (Test-Path $installScript)) {
     $installScript = Join-Path $root "scripts\install.ps1"
 }
 & $installScript -CpaDir $install
-$helperPath = (Join-Path $install "plugins\windows\amd64\cpaimage-helper.exe").Replace("\", "/")
 $authPath = (Join-Path $install "auth").Replace("\", "/")
 $pluginPath = (Join-Path $install "plugins").Replace("\", "/")
 New-Item -ItemType Directory -Force -Path (Join-Path $install "auth") | Out-Null
@@ -53,7 +52,6 @@ plugins:
       proxy_url: ""
       cf_cookies: ""
       cleanup_conversation: true
-      helper_path: "$helperPath"
 "@
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $install "config.yaml"), $config, $utf8NoBom)

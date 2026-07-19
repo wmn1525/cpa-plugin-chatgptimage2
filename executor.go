@@ -54,18 +54,36 @@ func (p *imagePlugin) executeHelper(req rpcExecutorRequest) (executionResult, er
 		CleanupConversation: cfg.CleanupConversation,
 	}
 	var response helperExecutionResult
+	var previousCredentials []helperCredential
+	var firstAuthError error
 	for attempt := 0; attempt < 2; attempt++ {
-		credentials, err := loadCredentials(cfg.RequestTimeout)
+		remaining := remainingTimeout(ctx)
+		if remaining <= 0 {
+			return executionResult{}, context.DeadlineExceeded
+		}
+		credentials, err := loadCredentials(remaining)
 		if err != nil {
+			if attempt > 0 {
+				return executionResult{}, firstAuthError
+			}
 			return executionResult{}, err
 		}
+		if attempt > 0 && !hasRefreshedCredential(previousCredentials, credentials) {
+			return executionResult{}, firstAuthError
+		}
 		payload.Credentials = credentials
+		payload.TimeoutSeconds = remainingTimeoutSeconds(ctx)
+		if payload.TimeoutSeconds <= 0 {
+			return executionResult{}, context.DeadlineExceeded
+		}
 		err = helper.Call(ctx, "images", payload, &response)
 		if err == nil {
 			break
 		}
-		status, expired := err.(*statusError)
-		if attempt == 0 && expired && status.status == http.StatusUnauthorized {
+		status, isStatus := err.(*statusError)
+		if attempt == 0 && isStatus && status.status == http.StatusUnauthorized {
+			previousCredentials = credentials
+			firstAuthError = err
 			continue
 		}
 		return executionResult{}, err
@@ -78,6 +96,38 @@ func (p *imagePlugin) executeHelper(req rpcExecutorRequest) (executionResult, er
 		return executionResult{}, &statusError{status: response.StatusCode, message: string(body)}
 	}
 	return executionResult{StatusCode: response.StatusCode, Headers: response.Headers, Body: body}, nil
+}
+
+// hasRefreshedCredential 检查重新读取的快照是否包含旧快照中没有的新 Token。
+func hasRefreshedCredential(previous []helperCredential, current []helperCredential) bool {
+	oldTokens := make(map[string]struct{}, len(previous))
+	for _, credential := range previous {
+		oldTokens[credential.AccessToken] = struct{}{}
+	}
+	for _, credential := range current {
+		if _, existed := oldTokens[credential.AccessToken]; !existed {
+			return true
+		}
+	}
+	return false
+}
+
+// remainingTimeoutSeconds 返回上下文剩余时间并向上取整到整秒。
+func remainingTimeoutSeconds(ctx context.Context) int {
+	remaining := remainingTimeout(ctx)
+	if remaining <= 0 {
+		return 0
+	}
+	return int((remaining + time.Second - 1) / time.Second)
+}
+
+// remainingTimeout 返回上下文截止时间前的剩余时长。
+func remainingTimeout(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	return time.Until(deadline)
 }
 
 // metadataString 从执行器元数据读取字符串字段。

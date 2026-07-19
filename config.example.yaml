@@ -11,6 +11,4 @@ plugins:
       proxy_url: ""
       cf_cookies: ""
       cleanup_conversation: true
-      # Windows CPA 会把 DLL 复制到临时目录加载，因此建议配置助手绝对路径。
-      helper_path: "C:/CLIProxyAPI/plugins/windows/amd64/cpaimage-helper.exe"
-
+      # 商店构建已内嵌助手；只有调试外部助手时才配置 helper_path。

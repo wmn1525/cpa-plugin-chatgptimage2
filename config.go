@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -54,38 +55,50 @@ func parseConfig(raw []byte) (runtimeConfig, error) {
 	if cfg.CleanupConversation != nil {
 		cleanup = *cfg.CleanupConversation
 	}
+	helperPath, errHelper := resolveHelperPath(strings.TrimSpace(cfg.HelperPath))
+	if errHelper != nil {
+		return runtimeConfig{}, errHelper
+	}
 	return runtimeConfig{
 		BaseURL:             baseURL,
 		RequestTimeout:      timeout,
 		ProxyURL:            strings.TrimSpace(cfg.ProxyURL),
 		CFCookies:           strings.TrimSpace(cfg.CFCookies),
 		CleanupConversation: cleanup,
-		HelperPath:          resolveHelperPath(strings.TrimSpace(cfg.HelperPath)),
+		HelperPath:          helperPath,
 	}, nil
 }
 
 // resolveHelperPath 解析助手路径并兼容 CPA 的 DLL 临时影子加载目录。
-func resolveHelperPath(configured string) string {
+func resolveHelperPath(configured string) (string, error) {
 	if configured != "" {
 		if filepath.IsAbs(configured) {
-			return filepath.Clean(configured)
+			return filepath.Clean(configured), nil
 		}
 		if absolute, err := filepath.Abs(configured); err == nil {
-			return absolute
+			return absolute, nil
 		}
 	}
+	helperName := helperExecutableName()
 	candidates := []string{
 		helperExecutablePath(),
-		filepath.Join("plugins", "windows", "amd64", "cpaimage-helper.exe"),
-		filepath.Join("plugins", "cpaimage-helper.exe"),
-		"cpaimage-helper.exe",
+		filepath.Join("plugins", runtime.GOOS, runtime.GOARCH, helperName),
+		filepath.Join("plugins", helperName),
+		helperName,
 	}
 	for _, candidate := range candidates {
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 			if absolute, errAbs := filepath.Abs(candidate); errAbs == nil {
-				return absolute
+				return absolute, nil
 			}
 		}
 	}
-	return candidates[0]
+	embeddedPath, errEmbedded := embeddedHelperPath()
+	if errEmbedded != nil {
+		return "", errEmbedded
+	}
+	if embeddedPath != "" {
+		return embeddedPath, nil
+	}
+	return candidates[0], nil
 }

@@ -14,7 +14,6 @@ if (Test-Path $runtime) {
 }
 New-Item -ItemType Directory -Force -Path $plugins, $auth | Out-Null
 Copy-Item -LiteralPath (Join-Path $root "dist\cpaimage.dll") -Destination $plugins
-Copy-Item -LiteralPath (Join-Path $root "dist\cpaimage-helper.exe") -Destination $plugins
 
 # 写入不包含真实凭证的测试账号和 CPA 配置。
 $authJson = @'
@@ -28,7 +27,6 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 $authPath = $auth.Replace("\", "/")
 $pluginPath = $plugins.Replace("\", "/")
-$helperPath = (Join-Path $plugins "cpaimage-helper.exe").Replace("\", "/")
 $configYaml = @"
 host: "127.0.0.1"
 port: 18317
@@ -46,7 +44,6 @@ plugins:
       base_url: "http://127.0.0.1:18081"
       request_timeout: "30s"
       cleanup_conversation: true
-      helper_path: "$helperPath"
 "@
 [IO.File]::WriteAllText((Join-Path $runtime "config.yaml"), $configYaml, $utf8NoBom)
 
@@ -76,11 +73,14 @@ try {
     if (-not $response.data[0].b64_json) {
         throw "CPA 插件未返回 b64_json 图片。"
     }
+    if (Test-Path (Join-Path $plugins "cpaimage-helper.exe")) {
+        throw "集成测试目录意外出现外部助手，未验证自包含动态库。"
+    }
 
     # 热上传第二个凭证，后续请求应直接从 CPA 发现而无需重启插件。
     [IO.File]::WriteAllText((Join-Path $auth "mock2.json"), $authJson2.Trim(), $utf8NoBom)
     Start-Sleep -Seconds 2
-    Invoke-RestMethod "http://127.0.0.1:18081/__test__/expire-first" -Method Post | Out-Null
+    Invoke-RestMethod "http://127.0.0.1:18081/__test__/expire-first-sse" -Method Post | Out-Null
 
     # 使用发布压测脚本完成严格 100 个请求，并在批次间反复热重载配置。
     $concurrentTotal = 100

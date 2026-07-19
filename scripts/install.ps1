@@ -18,16 +18,16 @@ if (-not (Test-Path (Join-Path $sourceRoot "cpaimage.dll"))) {
     }
 }
 $dll = Join-Path $sourceRoot "cpaimage.dll"
-$helper = Join-Path $sourceRoot "cpaimage-helper.exe"
-if (-not (Test-Path $dll) -or -not (Test-Path $helper)) {
-    throw "当前目录未找到 cpaimage.dll 和 cpaimage-helper.exe。"
+if (-not (Test-Path $dll)) {
+    throw "当前目录未找到 cpaimage.dll。"
 }
 
-# 安装 DLL 和助手到 CPA 标准平台目录。
+# 清理商店或旧安装留下的版本动态库，避免 CPA 优先加载旧版本。
 New-Item -ItemType Directory -Force -Path $target | Out-Null
+Get-ChildItem -LiteralPath $target -Filter "cpaimage-v*.dll" -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force
+Remove-Item -LiteralPath (Join-Path $target "cpaimage-helper.exe") -Force -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath $dll -Destination $target -Force
-Copy-Item -LiteralPath $helper -Destination $target -Force
-$helperPath = (Join-Path $target "cpaimage-helper.exe").Replace("\", "/")
 
 $snippet = @"
 plugins:
@@ -42,11 +42,10 @@ plugins:
       proxy_url: ""
       cf_cookies: ""
       cleanup_conversation: true
-      helper_path: "$helperPath"
 "@
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $target "cpaimage-config.yaml"), $snippet, $utf8NoBom)
 
 Write-Output "插件文件已安装到：$target"
-Write-Output "请把以下内容合并到 CPA 的 config.yaml，然后重启 CPA："
+Write-Output "请把以下内容合并到 CPA 的 config.yaml，然后完全重启 CPA："
 Write-Output $snippet

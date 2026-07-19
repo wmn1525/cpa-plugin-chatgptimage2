@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.1.0",
+    [string]$Version = "0.1.8",
     [ValidateSet("amd64", "arm64", "all")]
     [string]$Arch = "all"
 )
@@ -35,7 +35,7 @@ try {
         New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
         $dockerArtifactDir = $artifactDir.Replace("\", "/")
 
-        # 使用目标 Linux 平台构建动态库和独立助手，并导出到本地目录。
+        # 使用目标 Linux 平台构建嵌入助手的动态库。
         docker buildx build `
             --platform "linux/$currentArch" `
             --target release-artifacts `
@@ -47,8 +47,7 @@ try {
         }
 
         $pluginPath = Join-Path $artifactDir "cpaimage.so"
-        $helperPath = Join-Path $artifactDir "cpaimage-helper"
-        if (-not (Test-Path $pluginPath) -or -not (Test-Path $helperPath)) {
+        if (-not (Test-Path $pluginPath)) {
             throw "linux/$currentArch 构建完成但未找到预期产物。"
         }
 
@@ -56,8 +55,8 @@ try {
         $zipPath = Join-Path $dist ($packageName + ".zip")
         $tarPath = Join-Path $dist ($packageName + ".tar.gz")
 
-        # 压缩包保持扁平结构，可直接解压到 plugins/linux/<架构> 目录。
-        Compress-Archive -Path $pluginPath, $helperPath -DestinationPath $zipPath -Force
+        # ZIP 与手动安装 tar.gz 均保持只有根目录动态库。
+        Compress-Archive -Path $pluginPath -DestinationPath $zipPath -Force
         if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
             throw "未找到 tar，无法生成 tar.gz 发布包。"
         }
@@ -66,7 +65,7 @@ try {
         }
         Push-Location $artifactDir
         try {
-            tar -czf $tarPath.Replace("\", "/") cpaimage.so cpaimage-helper
+            tar -czf $tarPath.Replace("\", "/") cpaimage.so
             if ($LASTEXITCODE -ne 0) {
                 throw "linux/$currentArch tar.gz 打包失败。"
             }
@@ -83,7 +82,7 @@ try {
         $hash = Get-FileHash -Algorithm SHA256 $_
         "$($hash.Hash.ToLower())  $([IO.Path]::GetFileName($_))"
     }
-    $checksumPath = Join-Path $dist "SHA256SUMS"
+    $checksumPath = Join-Path $dist "checksums.txt"
     [IO.File]::WriteAllLines($checksumPath, $hashLines)
     Write-Output "Linux 发布包构建完成：$dist"
 } finally {

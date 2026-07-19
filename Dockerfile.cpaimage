@@ -1,21 +1,5 @@
 # syntax=docker/dockerfile:1.7
 
-# 在目标 Linux 平台原生构建 CPA 动态库，避免 Windows 与 Linux ABI 不兼容。
-FROM --platform=$TARGETPLATFORM golang:1.26-bookworm AS plugin-builder
-
-WORKDIR /src
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY go.mod go.sum ./
-RUN go mod download
-COPY *.go ./
-ARG VERSION=0.1.0
-RUN mkdir -p /out \
-    && CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
-       -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
-       -o /out/cpaimage.so . \
-    && rm -f /out/cpaimage.h
-
 # 在相同目标平台构建包含 curl_cffi 和 Pillow 的独立助手程序。
 FROM --platform=$TARGETPLATFORM python:3.12-bookworm AS helper-builder
 
@@ -27,20 +11,35 @@ COPY helper_entry.py ./
 RUN pyinstaller --noconfirm --clean --onefile --name cpaimage-helper \
     --distpath /out --workpath /tmp/pyinstaller --specpath /tmp helper_entry.py
 
-# 导出可直接发布的 Linux 插件文件，不包含 CPA 主程序镜像。
+# 在目标 Linux 平台构建嵌入助手的 CPA 动态库。
+FROM --platform=$TARGETPLATFORM golang:1.26-bookworm AS plugin-builder
+
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+COPY --from=helper-builder /out/cpaimage-helper /src/helper_payload/cpaimage-helper.bin
+ARG VERSION=dev
+RUN mkdir -p /out \
+    && CPAIMAGE_EXPECT_VERSION=${VERSION} go test -run '^TestRegistration$' \
+       -ldflags "-X=cpaimage.pluginVersion=${VERSION}" . \
+    && CGO_ENABLED=1 go build -tags embedded_helper -trimpath -buildmode=c-shared \
+       -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+       -o /out/cpaimage.so . \
+    && rm -f /out/cpaimage.h
+
+# 商店发布产物只导出自包含动态库。
 FROM scratch AS release-artifacts
 
 COPY --from=plugin-builder /out/cpaimage.so /cpaimage.so
-COPY --from=helper-builder /out/cpaimage-helper /cpaimage-helper
 
 # 把插件直接烘焙进 CPA 官方 Debian Bookworm 镜像。
 FROM --platform=$TARGETPLATFORM eceasy/cli-proxy-api:latest
 
 ARG TARGETARCH
 COPY --from=plugin-builder /out/cpaimage.so /tmp/cpaimage.so
-COPY --from=helper-builder /out/cpaimage-helper /tmp/cpaimage-helper
 RUN mkdir -p "/CLIProxyAPI/plugins/linux/${TARGETARCH}" \
     && mv /tmp/cpaimage.so "/CLIProxyAPI/plugins/linux/${TARGETARCH}/cpaimage.so" \
-    && mv /tmp/cpaimage-helper "/CLIProxyAPI/plugins/linux/${TARGETARCH}/cpaimage-helper" \
-    && chmod 0755 "/CLIProxyAPI/plugins/linux/${TARGETARCH}/cpaimage.so" \
-                  "/CLIProxyAPI/plugins/linux/${TARGETARCH}/cpaimage-helper"
+    && chmod 0755 "/CLIProxyAPI/plugins/linux/${TARGETARCH}/cpaimage.so"

@@ -1,6 +1,7 @@
 # 构建与发布产物
 /build/
 /dist/
+/helper_payload/
 /local-cpa/
 *.dll
 *.so

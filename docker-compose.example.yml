@@ -5,8 +5,8 @@ services:
       context: .
       dockerfile: Dockerfile.cpaimage
       args:
-        VERSION: "0.1.0"
-    image: local/cli-proxy-api-cpaimage:0.1.0
+        VERSION: "0.1.8"
+    image: local/cli-proxy-api-cpaimage:0.1.8
     container_name: cli-proxy-api
     ports:
       - "8317:8317"
@@ -15,4 +15,3 @@ services:
       - ./auths:/root/.cli-proxy-api
       - ./logs:/CLIProxyAPI/logs
     restart: unless-stopped
-
