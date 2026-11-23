@@ -25,6 +25,11 @@ PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
 OUTPUT_FILE_ID = "file_00000000aaaaaaaaaaaaaaaaaaaaaaaa"
+INPUT_FILE_ID = "file_input"
+INPUT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8AARGDiPwMAHfAD/aAzCYkAAAAASUVORK5CYII="
+)
+GIF_1X1 = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 
 
 class MockChatGPTHandler(BaseHTTPRequestHandler):
@@ -76,12 +81,21 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
         elif self.path == f"/backend-api/files/{OUTPUT_FILE_ID}/download":
             self._json({"download_url": self.server.base_url + "/image.png"})
+        elif self.path == f"/backend-api/files/{INPUT_FILE_ID}/download":
+            self._json({"download_url": self.server.base_url + "/input.png"})
         elif self.path == "/image.png":
+            output = getattr(self.server, "output_bytes", PNG_1X1)
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(PNG_1X1)))
+            self.send_header("Content-Length", str(len(output)))
             self.end_headers()
-            self.wfile.write(PNG_1X1)
+            self.wfile.write(output)
+        elif self.path == "/input.png":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(INPUT_PNG)))
+            self.end_headers()
+            self.wfile.write(INPUT_PNG)
         elif self.path == "/__test__/auth-count":
             with self.server.auth_lock:
                 count = len(self.server.seen_authorizations)
@@ -106,8 +120,7 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
         """处理 Sentinel、上传和 conversation 请求。"""
         self._record_auth()
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length) if length else b""
         if self.path.endswith("/chat-requirements/prepare"):
             self._json({"prepare_token": "prepare", "proofofwork": {"required": False},
                         "turnstile": {"required": False}})
@@ -131,10 +144,17 @@ class MockChatGPTHandler(BaseHTTPRequestHandler):
             delay = float(getattr(self.server, "generation_delay", 0))
             if delay > 0:
                 time.sleep(delay)
+            frames = []
+            if b"file-service:" in body:
+                echoed = {"conversation_id": "conv_mock", "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": [f"file-service://{INPUT_FILE_ID}", "edit"]}}}
+                frames.append("data: " + json.dumps(echoed) + "\n\n")
             payload = {"conversation_id": "conv_mock", "message": {
                 "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
                 "content": {"parts": [f"file-service://{OUTPUT_FILE_ID}"]}}}
-            raw = ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode()
+            frames.append("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n")
+            raw = "".join(frames).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(raw)))
@@ -181,6 +201,7 @@ class MockServer:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockChatGPTHandler)
         self.server.base_url = f"http://127.0.0.1:{self.server.server_port}"
         self.server.generation_delay = 0
+        self.server.output_bytes = PNG_1X1
         self.server.poll_lock = threading.Lock()
         self.server.poll_statuses = []
         self.server.auth_lock = threading.Lock()
@@ -262,6 +283,22 @@ class HelperTests(unittest.TestCase):
             edit["body_base64"] = base64.b64encode(raw).decode()
             result = handle_images(edit)
             self.assertEqual(result["status_code"], 200)
+            edited = json.loads(base64.b64decode(result["body_base64"]))
+            self.assertEqual(base64.b64decode(edited["data"][0]["b64_json"]), PNG_1X1)
+
+    def test_url_format_uses_real_image_mime(self) -> None:
+        """url 模式应按真实文件头标注 MIME，GIF 结果不能被标成 PNG。"""
+        with MockServer() as mock:
+            mock.server.output_bytes = GIF_1X1
+            payload = {"credentials": [{"access_token": "fake-token", "auth_index": "1"}],
+                       "base_url": mock.server.base_url, "timeout_seconds": 30,
+                       "cleanup_conversation": True, "content_type": "application/json",
+                       "stream": False, "request_path": "/v1/images/generations",
+                       "body_base64": base64.b64encode(b'{"prompt":"cat","response_format":"url"}').decode()}
+            result = handle_images(payload)
+            self.assertEqual(result["status_code"], 200)
+            body = json.loads(base64.b64decode(result["body_base64"]))
+            self.assertTrue(body["data"][0]["url"].startswith("data:image/gif;base64,"))
 
     def test_busy_credential_switches_immediately(self) -> None:
         """首选凭证忙碌时应立即尝试其他账号而不是阻塞。"""

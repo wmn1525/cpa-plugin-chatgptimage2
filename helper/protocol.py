@@ -246,6 +246,8 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
             normalized_images = composite_masks(normalized_images, normalized_masks)
         references = [backend.upload_image(value, f"image_{number}.png")
                       for number, value in enumerate(normalized_images, start=1)]
+        # 上传后的输入图片会随用户消息回显在 SSE 中，必须排除，否则会被当成生成结果返回。
+        input_file_ids = {str(reference.get("file_id") or "") for reference in references}
         backend.bootstrap()
         requirements = backend.get_requirements()
         conduit = backend.prepare_conversation(request.prompt, requirements)
@@ -256,8 +258,8 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
         for event in events:
             conversation_id = conversation_id or extract_conversation_id(event)
             found_files, found_sediments, found_images = extract_references(event)
-            append_unique(files, found_files)
-            append_unique(sediments, found_sediments)
+            append_unique(files, [value for value in found_files if value not in input_file_ids])
+            append_unique(sediments, [value for value in found_sediments if value not in input_file_ids])
             append_unique(direct_images, found_images)
         if direct_images:
             raw = base64.b64decode(direct_images[0])
@@ -273,7 +275,7 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
         encoded = base64.b64encode(raw).decode()
         item = {"revised_prompt": request.prompt}
         if request.response_format == "url":
-            item["url"] = "data:image/png;base64," + encoded
+            item["url"] = f"data:{image_mime_type(raw)};base64," + encoded
         else:
             item["b64_json"] = encoded
         return item
@@ -290,6 +292,19 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
             except Exception:
                 pass
         backend.close()
+
+
+def image_mime_type(raw: bytes) -> str:
+    """按文件头识别上游返回的真实图片类型，避免 url 模式标错 MIME。"""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/png"
 
 
 def normalize_image_source(backend: WebImageBackend, value: str) -> str:
