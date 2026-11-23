@@ -275,7 +275,7 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
         encoded = base64.b64encode(raw).decode()
         item = {"revised_prompt": request.prompt}
         if request.response_format == "url":
-            item["url"] = "data:image/png;base64," + encoded
+            item["url"] = f"data:{image_mime_type(raw)};base64," + encoded
         else:
             item["b64_json"] = encoded
         return item
@@ -292,6 +292,19 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
             except Exception:
                 pass
         backend.close()
+
+
+def image_mime_type(raw: bytes) -> str:
+    """按文件头识别上游返回的真实图片类型，避免 url 模式标错 MIME。"""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/png"
 
 
 def normalize_image_source(backend: WebImageBackend, value: str) -> str:
