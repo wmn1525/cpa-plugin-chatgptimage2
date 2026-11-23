@@ -246,6 +246,8 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
             normalized_images = composite_masks(normalized_images, normalized_masks)
         references = [backend.upload_image(value, f"image_{number}.png")
                       for number, value in enumerate(normalized_images, start=1)]
+        # 上传后的输入图片会随用户消息回显在 SSE 中，必须排除，否则会被当成生成结果返回。
+        input_file_ids = {str(reference.get("file_id") or "") for reference in references}
         backend.bootstrap()
         requirements = backend.get_requirements()
         conduit = backend.prepare_conversation(request.prompt, requirements)
@@ -256,8 +258,8 @@ def generate_with_credential(request: ImageRequest, credential: dict[str, Any], 
         for event in events:
             conversation_id = conversation_id or extract_conversation_id(event)
             found_files, found_sediments, found_images = extract_references(event)
-            append_unique(files, found_files)
-            append_unique(sediments, found_sediments)
+            append_unique(files, [value for value in found_files if value not in input_file_ids])
+            append_unique(sediments, [value for value in found_sediments if value not in input_file_ids])
             append_unique(direct_images, found_images)
         if direct_images:
             raw = base64.b64decode(direct_images[0])
